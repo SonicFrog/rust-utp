@@ -63,12 +63,10 @@ extern crate num_traits;
 // Public API
 pub use socket::UtpSocket;
 pub use socket::UtpListener;
-pub use stream::UtpStream;
 
 mod bit_iterator;
 mod error;
 mod packet;
 mod socket;
-mod stream;
 mod time;
 mod util;
