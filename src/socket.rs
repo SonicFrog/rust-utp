@@ -1275,6 +1275,7 @@ mod test {
         iotry!(client.close());
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_socket_ipv6() {
         let server_addr = next_test_ip6();
