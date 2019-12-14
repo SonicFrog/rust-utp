@@ -1,14 +1,14 @@
 [package]
-authors = ["Ricardo Martins <ricardo@scarybox.net>"]
-description = "A µTP (Micro/uTorrent Transport Library) library implemented in Rust"
+authors = [ "Ricardo Martins <ricardo@scarybox.net>", "Ogier Bouvier <ogier.bouvier@epfl.ch" ]
+description = "An async µTP (Micro/uTorrent Transport Library) library for Tokio"
 documentation = "http://meqif.github.io/rust-utp"
 homepage = "https://github.com/meqif/rust-utp"
-keywords = ["utp", "networking", "protocol", "transport"]
+keywords = [ "async", "utp", "networking", "protocol", "transport" ]
 license = "MIT/Apache-2.0"
 name = "utp"
 readme = "README.md"
-repository = "https://github.com/meqif/rust-utp"
-version = "0.7.1-pre"
+repository = "https://github.com/SonicFrog/tokio-utp"
+version = "0.8.0"
 edition = "2018"
 
 [dependencies]
