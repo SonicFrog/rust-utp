@@ -37,10 +37,12 @@ extern crate log;
 // Public API
 pub use socket::UtpListener;
 pub use socket::UtpSocket;
+pub use stream::UtpStream;
 
 mod bit_iterator;
 mod error;
 mod packet;
 mod socket;
+mod stream;
 mod time;
 mod util;
