@@ -8,7 +8,7 @@ pub const HEADER_SIZE: usize = 20;
 
 macro_rules! u8_to_unsigned_be {
     ($src:ident, $start:expr, $end:expr, $t:ty) => ({
-        (0 .. $end - $start + 1).rev().fold(0, |acc, i| acc | $src[$start+i] as $t << (i * 8))
+        (0 ..= $end - $start ).rev().fold(0, |acc, i| acc | $src[$start+i] as $t << (i * 8))
     })
 }
 
@@ -239,27 +239,32 @@ impl Packet {
         Packet(inner)
     }
 
+    #[allow(clippy::cast_ptr_alignment)]
+    fn header(&self) -> &PacketHeader {
+        unsafe { &*(self.0.as_ptr() as *const PacketHeader) }
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    fn header_mut(&mut self) -> &mut PacketHeader {
+        unsafe { &mut *(self.0.as_mut_ptr() as *mut PacketHeader) }
+    }
+
     #[inline]
     pub fn set_type(&mut self, t: PacketType) {
-        let header =
-            unsafe { &mut *(self.0.as_mut_ptr() as *mut PacketHeader) };
-        header.set_type(t);
+        self.header_mut().set_type(t);
     }
 
     #[inline]
     pub fn get_type(&self) -> PacketType {
-        let header = unsafe { &*(self.0.as_ptr() as *const PacketHeader) };
-        header.get_type()
+        self.header().get_type()
     }
 
     pub fn get_version(&self) -> u8 {
-        let header = unsafe { &*(self.0.as_ptr() as *const PacketHeader) };
-        header.get_version()
+        self.header().get_version()
     }
 
     pub fn get_extension_type(&self) -> ExtensionType {
-        let header = unsafe { &*(self.0.as_ptr() as *const PacketHeader) };
-        header.get_extension_type()
+        self.header().get_extension_type()
     }
 
     pub fn extensions(&self) -> ExtensionIterator {
@@ -285,25 +290,19 @@ impl Packet {
     }
 
     pub fn timestamp(&self) -> Timestamp {
-        let header = unsafe { &*(self.0.as_ptr() as *const PacketHeader) };
-        u32::from_be(header.timestamp).into()
+        u32::from_be(self.header().timestamp).into()
     }
 
     pub fn set_timestamp(&mut self, timestamp: Timestamp) {
-        let header =
-            unsafe { &mut *(self.0.as_mut_ptr() as *mut PacketHeader) };
-        header.timestamp = u32::from(timestamp).to_be();
+        self.header_mut().timestamp = u32::from(timestamp).to_be();
     }
 
     pub fn timestamp_difference(&self) -> Delay {
-        let header = unsafe { &*(self.0.as_ptr() as *const PacketHeader) };
-        u32::from_be(header.timestamp_difference).into()
+        u32::from_be(self.header().timestamp_difference).into()
     }
 
     pub fn set_timestamp_difference(&mut self, delay: Delay) {
-        let header =
-            unsafe { &mut *(self.0.as_mut_ptr() as *mut PacketHeader) };
-        header.timestamp_difference = u32::from(delay).to_be();
+        self.header_mut().timestamp_difference = u32::from(delay).to_be();
     }
 
     make_getter!(seq_nr, u16, u16);
@@ -661,11 +660,11 @@ mod tests {
     #[test]
     fn test_packet_encode() {
         let payload = b"Hello\n".to_vec();
-        let timestamp = Timestamp(15270793);
-        let timestamp_diff = Delay(1707040186);
+        let timestamp = Timestamp(15_270_793);
+        let timestamp_diff = Delay(1_707_040_186);
         let (connection_id, seq_nr, ack_nr): (u16, u16, u16) =
             (16808, 15090, 17096);
-        let window_size: u32 = 1048576;
+        let window_size: u32 = 1_048_576;
         let mut packet = Packet::with_payload(&payload[..]);
         packet.set_type(Data);
         packet.set_timestamp(timestamp);
@@ -698,11 +697,11 @@ mod tests {
     #[test]
     fn test_packet_encode_with_payload() {
         let payload = b"Hello\n".to_vec();
-        let timestamp = Timestamp(15270793);
-        let timestamp_diff = Delay(1707040186);
+        let timestamp = Timestamp(15_270_793);
+        let timestamp_diff = Delay(1_707_040_186);
         let (connection_id, seq_nr, ack_nr): (u16, u16, u16) =
             (16808, 15090, 17096);
-        let window_size: u32 = 1048576;
+        let window_size: u32 = 1_048_576;
         let mut packet = Packet::with_payload(&payload[..]);
         packet.set_timestamp(timestamp);
         packet.set_timestamp_difference(timestamp_diff);
@@ -768,7 +767,7 @@ mod tests {
             {
                 TestResult::from_bool(packet.is_err())
             } else if let Ok(packet) = packet {
-                TestResult::from_bool(&packet.as_ref() == &x.as_slice())
+                TestResult::from_bool(packet.as_ref() == x.as_slice())
             } else {
                 TestResult::from_bool(false)
             }
@@ -821,12 +820,11 @@ mod tests {
     }
 }
 
-#[cfg(all(feature = "unstable", test))]
+#[cfg(all(feature = "nightly", test))]
 mod bench {
-    extern crate test;
+    use crate::packet::{Packet, TryFrom};
 
-    use self::test::Bencher;
-    use packet::{Packet, TryFrom};
+    use test::{black_box, Bencher};
 
     #[bench]
     fn bench_decode(b: &mut Bencher) {
@@ -836,7 +834,7 @@ mod bench {
             0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
         ];
         b.iter(|| {
-            let _ = test::black_box(Packet::try_from(&buf));
+            let _ = black_box(Packet::try_from(&buf));
         });
     }
 
@@ -844,7 +842,7 @@ mod bench {
     fn bench_encode(b: &mut Bencher) {
         let packet = Packet::with_payload(&[1, 2, 3, 4, 5, 6]);
         b.iter(|| {
-            let _ = test::black_box(packet.as_ref());
+            let _ = black_box(packet.as_ref());
         });
     }
 
@@ -864,7 +862,7 @@ mod bench {
         ];
         let packet = Packet::try_from(&buf).unwrap();
         b.iter(|| {
-            let _ = test::black_box(packet.payload());
+            let _ = black_box(packet.payload());
         });
     }
 
@@ -884,7 +882,7 @@ mod bench {
         ];
         let packet = Packet::try_from(&buf).unwrap();
         b.iter(|| {
-            let _ = test::black_box(packet.extensions().count());
+            let _ = black_box(packet.extensions().count());
         });
     }
 }

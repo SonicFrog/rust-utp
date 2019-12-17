@@ -41,20 +41,22 @@ pub fn generate_sequential_identifiers() -> (u16, u16) {
 
 #[cfg(test)]
 mod test {
+    use std::f64::EPSILON;
+
     use crate::util::*;
 
     #[test]
     fn test_ewma_empty_vector() {
         let empty: Vec<u32> = vec![];
         let alpha = 1.0 / 3.0;
-        assert_eq!(ewma(empty.iter(), alpha), 0.0);
+        assert!(ewma(empty.iter(), alpha).abs() < EPSILON);
     }
 
     #[test]
     fn test_ewma_one_element() {
         let input = vec![1u32];
         let alpha = 1.0 / 3.0;
-        assert_eq!(ewma(input.iter(), alpha), 1.0);
+        assert!(ewma(input.iter(), alpha) - 1.0 < EPSILON);
     }
 
     #[test]
@@ -71,9 +73,11 @@ mod test {
             3773.0 / 729.0,
             13378.0 / 2187.0,
             46439.0 / 6561.0,
-            158488.0 / 19683.0,
+            158_488.0 / 19_683.0,
         ];
-        assert_eq!(ewma(input.iter(), alpha), expected[expected.len() - 1]);
+        assert!(
+            ewma(input.iter(), alpha) - expected[expected.len() - 1] < EPSILON
+        );
     }
 
     #[test]

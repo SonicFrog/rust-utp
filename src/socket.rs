@@ -263,7 +263,7 @@ impl UtpSocket {
 
         debug!("connected to: {}", socket.connected_to);
 
-        return Ok(socket);
+        Ok(socket)
     }
 
     /// Gracefully closes connection to peer.
@@ -317,7 +317,7 @@ impl UtpSocket {
         let read = self.flush_incoming_buffer(buf);
 
         if read > 0 {
-            return Ok((read, self.connected_to));
+            Ok((read, self.connected_to))
         } else {
             // If the socket received a reset packet and all data has been
             // flushed, then it can't receive anything else
@@ -389,7 +389,7 @@ impl UtpSocket {
 
             let elapsed = start.elapsed();
             let elapsed_ms = elapsed.as_secs() * 1000
-                + (elapsed.subsec_nanos() / 1000_000) as u64;
+                + (elapsed.subsec_millis() / 1_000_000) as u64;
             debug!("{} ms elapsed", elapsed_ms);
             retries += 1;
         }
@@ -525,7 +525,7 @@ impl UtpSocket {
                 use std::ptr::copy;
                 copy(src.as_ptr(), dst.as_mut_ptr(), max_len);
             }
-            return max_len;
+            max_len
         }
 
         // Return pending data from a partially read packet
@@ -559,7 +559,7 @@ impl UtpSocket {
             return flushed;
         }
 
-        return 0;
+        0
     }
 
     /// Checks if any pending data can be read without any syscalls
@@ -767,7 +767,7 @@ impl UtpSocket {
             sack[byte] |= 1 << bit;
         }
 
-        return sack;
+        sack
     }
 
     /// Sends a fast resend request to the remote peer.
@@ -828,7 +828,7 @@ impl UtpSocket {
             .iter()
             .position(|packet| packet.seq_nr() == self.last_acked)
         {
-            for _ in 0..position + 1 {
+            for _ in 0..=position {
                 let packet = self.send_window.remove(0);
                 self.curr_window -= packet.len() as u32;
             }
@@ -991,7 +991,7 @@ impl UtpSocket {
         debug!("min_base_delay: {}", min_base_delay);
         debug!("queuing_delay: {}", queuing_delay);
 
-        return queuing_delay;
+        queuing_delay
     }
 
     /// Calculates the new congestion window size, increasing it or decreasing it.
@@ -1288,14 +1288,14 @@ mod test {
         BASE_PORT + NEXT_OFFSET.fetch_add(1, Ordering::Relaxed) as u16
     }
 
-    fn next_test_ip4<'a>() -> SocketAddr {
+    fn next_test_ip4() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(
             "127.0.0.1".parse().unwrap(),
             next_test_port(),
         ))
     }
 
-    fn next_test_ip6<'a>() -> SocketAddr {
+    fn next_test_ip6() -> SocketAddr {
         SocketAddr::V6(SocketAddrV6::new(
             "::1".parse().unwrap(),
             next_test_port(),
@@ -2420,12 +2420,12 @@ mod test {
     #[tokio::test]
     async fn test_connection_loss_waiting() {
         let server_addr = next_test_ip4();
-        let mut server = iotry!(UtpSocket::bind(server_addr.into()));
+        let mut server = iotry!(UtpSocket::bind(server_addr));
         // Decrease timeouts for faster tests
         server.congestion_timeout = 1;
         let attempts = server.max_retransmission_retries;
 
-        let mut client = iotry!(UtpSocket::connect(server_addr.into()));
+        let mut client = iotry!(UtpSocket::connect(server_addr));
         iotry!(client.send_to(&[0]));
         // Simulate connection loss by killing the socket.
         client.state = SocketState::Closed;
