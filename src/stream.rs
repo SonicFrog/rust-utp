@@ -20,9 +20,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// timeout.
 pub struct UtpStream {
     socket: UtpSocket,
-    close_fut: Pin<Box<dyn Future<Output = Result<()>>>>,
-    write_fut: Option<Pin<Box<dyn Future<Output = Result<usize>>>>>,
-    flush_fut: Option<Pin<Box<dyn Future<Output = Result<()>>>>>,
 }
 
 impl UtpStream {
@@ -41,19 +38,22 @@ impl UtpStream {
     }
 
     fn from_raw_parts(socket: UtpSocket) -> Self {
-        Self {
-            socket,
-            flush_fut: None,
-            close_fut: Box::pin(socket.close()),
-        }
+        Self { socket }
     }
 
+    /// Returns the local address to which this `UtpStream` is bound
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.socket.local_addr()
     }
 
+    /// Returns the remote address to which this `UtpStream` is connected
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         self.socket.peer_addr()
+    }
+
+    /// Close this `UtpStream` and flushes all pending packets
+    pub async fn close(&mut self) -> Result<()> {
+        self.socket.close().await
     }
 }
 
@@ -74,40 +74,159 @@ impl AsyncRead for UtpStream {
     }
 }
 
-impl AsyncWrite for UtpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<Result<usize>> {
-        if let Some(mut f) = self.write_fut {
-            // already in the process of writing
-            f.as_mut().poll(cx)
-        } else {
-            let mut future = Box::pin(self.socket.send_to(buf));
+impl AsyncWrite for UtpStream
+where
+    Self: Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        let mut future = self.socket.send_to(buf);
 
-            if let Poll::Ready(Ok(written)) = future.as_mut().poll(cx) {
-                Poll::Ready(Ok(written))
-            } else {
-                self.write_fut = Some(future);
-                Poll::Pending
-            }
-        }
+        unsafe { Pin::new_unchecked(&mut future) }.poll(cx)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-        match self.as_mut().flush_fut {
-            Some(ref mut v) => v.as_mut().poll(cx),
-            None => {
-                let mut future = Box::pin(self.socket.flush());
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        let mut future = self.socket.flush();
 
-                if let Poll::Ready(e) = future.as_mut().poll(cx) {
-                    Poll::Ready(e)
-                } else {
-                    self.flush_fut = Some(future);
-                    Poll::Pending
-                }
-            }
-        }
+        unsafe { Pin::new_unchecked(&mut future) }.poll(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-        self.close_fut.as_mut().poll(cx)
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        let mut future = self.socket.close();
+
+        unsafe { Pin::new_unchecked(&mut future) }.poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    use super::*;
+    use crate::UtpSocket;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ErrorKind};
+    use tokio::task;
+
+    const ADDR: &str = "127.0.0.1";
+    static PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
+
+    fn next_test_ip4() -> (Ipv4Addr, u16) {
+        (
+            ADDR.parse().unwrap(),
+            PORT_OFFSET.fetch_add(1, Ordering::Relaxed) + 9000,
+        )
+    }
+
+    fn next_test_addr() -> SocketAddr {
+        next_test_ip4().into()
+    }
+
+    #[tokio::test]
+    async fn async_write() {
+        let addr = next_test_addr();
+
+        let mut client = UtpSocket::bind(addr).await.expect("failed to bind");
+
+        task::spawn(async move {
+            let mut stream =
+                UtpStream::connect(addr).await.expect("failed to connect");
+            let buf = [0u8; 256];
+
+            stream.write(&buf).await.expect("failed to send");
+
+            stream.close().await.expect("failed to flush");
+        });
+
+        let mut buf = [1u8; 1024];
+
+        let (read, _) =
+            client.recv_from(&mut buf).await.expect("failed to receive");
+
+        assert_eq!(read, 256usize, "read incorrect amount of bytes");
+
+        client.close().await.expect("failed to close stream");
+    }
+
+    #[tokio::test]
+    async fn async_read() {
+        let addr = next_test_addr();
+
+        task::spawn(async move {
+            let mut client =
+                UtpSocket::connect(addr).await.expect("failed to bind");
+            let buf = [0u8; 256];
+            let read = client.send_to(&buf).await.expect("failed to send_to");
+
+            assert_eq!(read, 256, "read wrong amount of bytes");
+
+            client.close().await.expect("failed to close");
+        });
+
+        let mut buf = [1u8; 1024];
+        let mut stream =
+            UtpStream::bind(addr).await.expect("failed to connect");
+
+        stream.read(&mut buf).await.expect("failed to read");
+        stream.close().await.expect("failed to close");
+    }
+
+    #[tokio::test]
+    async fn async_read_exact_too_much() {
+        let addr = next_test_addr();
+
+        task::spawn(async move {
+            let buf = [1u8; 512];
+            let mut client =
+                UtpSocket::connect(addr).await.expect("failed to bind");
+
+            client.send_to(&buf).await.expect("failed to write");
+            client.close().await.expect("failed to close");
+        });
+
+        let mut buf = [0u8; 1024];
+        let mut stream = UtpStream::bind(addr).await.expect("failed to bind");
+
+        let err = stream
+            .read_exact(&mut buf)
+            .await
+            .expect_err("did not encounter timeout");
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "error kind is wrong");
+    }
+
+    #[tokio::test]
+    async fn async_read_exact() {
+        let addr = next_test_addr();
+
+        task::spawn(async move {
+            let buf = [1u8; 256];
+            let mut client =
+                UtpSocket::connect(addr).await.expect("failed to bind");
+
+            for _ in 0..4 {
+                client.send_to(&buf).await.expect("failed to write");
+            }
+
+            client.close().await.expect("failed to close");
+        });
+
+        let mut buf = [0u8; 1024];
+        let mut stream = UtpStream::bind(addr).await.expect("failed to bind");
+
+        stream
+            .read_exact(&mut buf)
+            .await
+            .expect("did not succesfully received the data");
     }
 }

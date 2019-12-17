@@ -31,7 +31,8 @@ impl<'a> Iterator for BitIterator<'a> {
 
     fn next(&mut self) -> Option<bool> {
         if self.next_index != self.end_index {
-            let (byte_index, bit_index) = (self.next_index / U8BITS, self.next_index % U8BITS);
+            let (byte_index, bit_index) =
+                (self.next_index / U8BITS, self.next_index % U8BITS);
             let bit = self.object[byte_index] >> bit_index & 0x1;
             self.next_index += 1;
             Some(bit == 0x1)

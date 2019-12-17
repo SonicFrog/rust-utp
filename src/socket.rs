@@ -31,10 +31,11 @@ const MAX_SYN_RETRIES: u32 = 5; // maximum connection retries
 const MAX_RETRANSMISSION_RETRIES: u32 = 5; // maximum retransmission retries
 const WINDOW_SIZE: u32 = 1024 * 1024; // local receive window size
 
-// Maximum time (in microseconds) to wait for incoming packets when the send window is full
+/// Maximum time (in microseconds) to wait for incoming packets when the send
+/// window is full
 const PRE_SEND_TIMEOUT: u32 = 500_000;
 
-// Maximum age of base delay sample (60 seconds)
+/// Maximum age of base delay sample (60 seconds)
 const MAX_BASE_DELAY_AGE: Delay = Delay(60_000_000);
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -52,16 +53,17 @@ struct DelayDifferenceSample {
     difference: Delay,
 }
 
-/// A structure that represents a uTP (Micro Transport Protocol) connection between a local socket
-/// and a remote socket.
+/// A structure that represents a uTP (Micro Transport Protocol) connection
+/// between a local socket and a remote socket.
 ///
-/// The socket will be closed when the value is dropped (either explicitly or when it goes out of
-/// scope).
+/// The socket will be closed when the value is dropped (either explicitly or
+/// when it goes out of scope).
 ///
-/// The default maximum retransmission retries is 5, which translates to about 16 seconds. It can be
-/// changed by assigning the desired maximum retransmission retries to a socket's
-/// `max_retransmission_retries` field. Notice that the initial congestion timeout is 500 ms and
-/// doubles with each timeout.
+/// The default maximum retransmission retries is 5, which translates to about
+/// 16 seconds. It can be changed by assigning the desired maximum
+/// retransmission retries to a socket's `max_retransmission_retries` field.
+/// Notice that the initial congestion timeout is 500 ms and doubles with each
+/// timeout.
 pub struct UtpSocket {
     /// The wrapped UDP socket
     socket: UdpSocket,
@@ -93,7 +95,8 @@ pub struct UtpSocket {
     /// Packets not yet sent
     unsent_queue: VecDeque<Packet>,
 
-    /// How many ACKs did the socket receive for packet with sequence number equal to `ack_nr`
+    /// How many ACKs did the socket receive for packet with sequence number
+    /// equal to `ack_nr`
     duplicate_ack_count: u32,
 
     /// Sequence number of the latest packet the remote peer acknowledged
@@ -123,10 +126,12 @@ pub struct UtpSocket {
     /// Rolling window of packet delay to remote peer
     base_delays: VecDeque<Delay>,
 
-    /// Rolling window of the difference between sending a packet and receiving its acknowledgement
+    /// Rolling window of the difference between sending a packet and receiving
+    /// its acknowledgement
     current_delays: Vec<DelayDifferenceSample>,
 
-    /// Difference between timestamp of the latest packet received and time of reception
+    /// Difference between timestamp of the latest packet received and time of
+    /// reception
     their_delay: Delay,
 
     /// Start of the current minute for sampling purposes
@@ -143,7 +148,8 @@ pub struct UtpSocket {
 }
 
 impl UtpSocket {
-    /// Creates a new UTP socket from the given UDP socket and the remote peer's address.
+    /// Creates a new UTP socket from the given UDP socket and the remote peer's
+    /// address.
     ///
     /// The connection identifier of the resulting socket is randomly generated.
     fn from_raw_parts(s: UdpSocket, src: SocketAddr) -> UtpSocket {
@@ -180,11 +186,6 @@ impl UtpSocket {
     }
 
     /// Creates a new UTP socket from the given address.
-    ///
-    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
-    /// for concrete examples.
-    ///
-    /// If more than one valid address is specified, only the first will be used.
     pub async fn bind(addr: SocketAddr) -> Result<UtpSocket> {
         let socket = UdpSocket::bind(addr).await?;
 
@@ -198,7 +199,9 @@ impl UtpSocket {
 
     /// Returns the socket address of the remote peer of this UTP connection.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        if self.state == SocketState::Connected || self.state == SocketState::FinSent {
+        if self.state == SocketState::Connected
+            || self.state == SocketState::FinSent
+        {
             Ok(self.connected_to)
         } else {
             Err(SocketError::NotConnected.into())
@@ -206,11 +209,6 @@ impl UtpSocket {
     }
 
     /// Opens a connection to a remote host by hostname or IP address.
-    ///
-    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
-    /// for concrete examples.
-    ///
-    /// If more than one valid address is specified, only the first will be used.
     pub async fn connect(addr: SocketAddr) -> Result<UtpSocket> {
         let my_addr = match addr {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0u16).into(),
@@ -312,20 +310,24 @@ impl UtpSocket {
     /// On success, returns the number of bytes read and the sender's address.
     /// Returns 0 bytes read after receiving a FIN packet when the remaining
     /// in-flight packets are consumed.
-    pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+    pub async fn recv_from(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<(usize, SocketAddr)> {
         let read = self.flush_incoming_buffer(buf);
 
         if read > 0 {
             return Ok((read, self.connected_to));
         } else {
-            // If the socket received a reset packet and all data has been flushed, then it can't
-            // receive anything else
+            // If the socket received a reset packet and all data has been
+            // flushed, then it can't receive anything else
             if self.state == SocketState::ResetReceived {
                 return Err(SocketError::ConnectionReset.into());
             }
 
             loop {
-                // A closed socket with no pending data can only "read" 0 new bytes.
+                // A closed socket with no pending data can only "read" 0 new
+                // bytes.
                 if self.state == SocketState::Closed {
                     return Ok((0, self.connected_to));
                 }
@@ -348,7 +350,8 @@ impl UtpSocket {
 
         // Try to receive a packet and handle timeouts
         loop {
-            // Abort loop if the current try exceeds the maximum number of retransmission retries.
+            // Abort loop if the current try exceeds the maximum number of
+            // retransmission retries.
             if retries >= self.max_retransmission_retries {
                 self.state = SocketState::Closed;
                 return Err(SocketError::ConnectionTimedOut.into());
@@ -356,7 +359,10 @@ impl UtpSocket {
 
             if self.state != SocketState::New {
                 let to = Duration::from_millis(self.congestion_timeout);
-                debug!("setting read timeout of {} ms", self.congestion_timeout);
+                debug!(
+                    "setting read timeout of {} ms",
+                    self.congestion_timeout
+                );
 
                 match timeout(to, self.socket.recv_from(&mut b)).await {
                     Ok(Ok((r, s))) => {
@@ -382,7 +388,8 @@ impl UtpSocket {
             };
 
             let elapsed = start.elapsed();
-            let elapsed_ms = elapsed.as_secs() * 1000 + (elapsed.subsec_nanos() / 1000_000) as u64;
+            let elapsed_ms = elapsed.as_secs() * 1000
+                + (elapsed.subsec_nanos() / 1000_000) as u64;
             debug!("{} ms elapsed", elapsed_ms);
             retries += 1;
         }
@@ -405,8 +412,8 @@ impl UtpSocket {
             debug!("sent {:?}", pkt);
         }
 
-        // Insert data packet into the incoming buffer if it isn't a duplicate of a previously
-        // discarded packet
+        // Insert data packet into the incoming buffer if it isn't a duplicate
+        // of a previously discarded packet
         if packet.get_type() == PacketType::Data
             && packet.seq_nr().wrapping_sub(self.last_dropped) > 0
         {
@@ -425,11 +432,11 @@ impl UtpSocket {
 
         // There are three possible cases here:
         //
-        // - If the socket is sending and waiting for acknowledgements (the send window is
-        //   not empty), resend the first unacknowledged packet;
+        // - If the socket is sending and waiting for acknowledgements (the send
+        //   window is not empty), resend the first unacknowledged packet;
         //
-        // - If the socket is not sending and it hasn't sent a FIN yet, then it's waiting
-        //   for incoming packets: send a fast resend request;
+        // - If the socket is not sending and it hasn't sent a FIN yet, then
+        //   it's waiting for incoming packets: send a fast resend request;
         //
         // - If the socket sent a FIN previously, resend it.
         debug!(
@@ -441,8 +448,8 @@ impl UtpSocket {
         );
 
         if self.send_window.is_empty() {
-            // The socket is trying to close, all sent packets were acknowledged, and it has
-            // already sent a FIN: resend it.
+            // The socket is trying to close, all sent packets were acknowledged,
+            // and it has already sent a FIN: resend it.
             if self.state == SocketState::FinSent {
                 let mut packet = Packet::new();
                 packet.set_connection_id(self.sender_connection_id);
@@ -457,14 +464,15 @@ impl UtpSocket {
                     .await?;
                 debug!("resent FIN: {:?}", packet);
             } else if self.state != SocketState::New {
-                // The socket is waiting for incoming packets but the remote peer is silent:
-                // send a fast resend request.
+                // The socket is waiting for incoming packets but the remote
+                // peer is silent: send a fast resend request.
                 debug!("sending fast resend request");
                 self.send_fast_resend_request();
             }
         } else {
-            // The socket is sending data packets but there is no reply from the remote
-            // peer: resend the first unacknowledged packet with the current timestamp.
+            // The socket is sending data packets but there is no reply from the
+            // remote peer: resend the first unacknowledged packet with the
+            // current timestamp.
             let packet = &mut self.send_window[0];
             packet.set_timestamp(now_microseconds());
             self.socket
@@ -491,7 +499,8 @@ impl UtpSocket {
         resp
     }
 
-    /// Removes a packet in the incoming buffer and updates the current acknowledgement number.
+    /// Removes a packet in the incoming buffer and updates the current
+    /// acknowledgement number.
     fn advance_incoming_buffer(&mut self) -> Option<Packet> {
         if !self.incoming_buffer.is_empty() {
             let packet = self.incoming_buffer.remove(0);
@@ -537,12 +546,14 @@ impl UtpSocket {
             && (self.ack_nr == self.incoming_buffer[0].seq_nr()
                 || self.ack_nr + 1 == self.incoming_buffer[0].seq_nr())
         {
-            let flushed = unsafe_copy(&self.incoming_buffer[0].payload()[..], buf);
+            let flushed =
+                unsafe_copy(&self.incoming_buffer[0].payload()[..], buf);
 
             if flushed == self.incoming_buffer[0].payload().len() {
                 self.advance_incoming_buffer();
             } else {
-                self.pending_data = self.incoming_buffer[0].payload()[flushed..].to_vec();
+                self.pending_data =
+                    self.incoming_buffer[0].payload()[flushed..].to_vec();
             }
 
             return flushed;
@@ -551,8 +562,13 @@ impl UtpSocket {
         return 0;
     }
 
-    /// Sends data on the socket to the remote peer. On success, returns the number of bytes
-    /// written.
+    /// Checks if any pending data can be read without any syscalls
+    pub(crate) fn should_read(&self) -> bool {
+        self.incoming_buffer.is_empty() && self.pending_data.is_empty()
+    }
+
+    /// Sends data on the socket to the remote peer. On success, returns the
+    /// number of bytes written.
     //
     // # Implementation details
     //
@@ -616,9 +632,11 @@ impl UtpSocket {
         let max_inflight = max(MIN_CWND * MSS, max_inflight);
         let now = now_microseconds();
 
-        // Wait until enough in-flight packets are acknowledged for rate control purposes, but don't
-        // wait more than 500 ms (PRE_SEND_TIMEOUT) before sending the packet.
-        while self.curr_window >= max_inflight && now_microseconds() - now < PRE_SEND_TIMEOUT.into()
+        // Wait until enough in-flight packets are acknowledged for rate control
+        // purposes, but don't wait more than 500 ms (PRE_SEND_TIMEOUT) before
+        // sending the packet.
+        while self.curr_window >= max_inflight
+            && now_microseconds() - now < PRE_SEND_TIMEOUT.into()
         {
             debug!("self.curr_window: {}", self.curr_window);
             debug!("max_inflight: {}", max_inflight);
@@ -632,10 +650,10 @@ impl UtpSocket {
             now_microseconds() - now
         );
 
-        // Check if it still makes sense to send packet, as we might be trying to resend a lost
-        // packet acknowledged in the receive loop above.
-        // If there were no wrapping around of sequence numbers, we'd simply check if the packet's
-        // sequence number is greater than `last_acked`.
+        // Check if it still makes sense to send packet, as we might be trying
+        // to resend a lost packet acknowledged in the receive loop above.
+        // If there were no wrapping around of sequence numbers, we'd simply
+        // check if the packet's sequence number is greater than `last_acked`.
         let distance_a = packet.seq_nr().wrapping_sub(self.last_acked);
         let distance_b = self.last_acked.wrapping_sub(packet.seq_nr());
         if distance_a > distance_b {
@@ -653,10 +671,12 @@ impl UtpSocket {
 
     // Insert a new sample in the base delay list.
     //
-    // The base delay list contains at most `BASE_HISTORY` samples, each sample is the minimum
-    // measured over a period of a minute (MAX_BASE_DELAY_AGE).
+    // The base delay list contains at most `BASE_HISTORY` samples, each sample
+    // is the minimum measured over a period of a minute (MAX_BASE_DELAY_AGE).
     fn update_base_delay(&mut self, base_delay: Delay, now: Timestamp) {
-        if self.base_delays.is_empty() || now - self.last_rollover > MAX_BASE_DELAY_AGE {
+        if self.base_delays.is_empty()
+            || now - self.last_rollover > MAX_BASE_DELAY_AGE
+        {
             // Update last rollover
             self.last_rollover = now;
 
@@ -676,12 +696,14 @@ impl UtpSocket {
         }
     }
 
-    /// Inserts a new sample in the current delay list after removing samples older than one RTT, as
-    /// specified in RFC6817.
+    /// Inserts a new sample in the current delay list after removing samples
+    /// older than one RTT, as specified in RFC6817.
     fn update_current_delay(&mut self, v: Delay, now: Timestamp) {
         // Remove samples more than one RTT old
         let rtt = (self.rtt as i64 * 100).into();
-        while !self.current_delays.is_empty() && now - self.current_delays[0].received_at > rtt {
+        while !self.current_delays.is_empty()
+            && now - self.current_delays[0].received_at > rtt
+        {
             self.current_delays.remove(0);
         }
 
@@ -700,7 +722,8 @@ impl UtpSocket {
             (self.rtt + self.rtt_variance * 4) as u64,
             MIN_CONGESTION_TIMEOUT,
         );
-        self.congestion_timeout = min(self.congestion_timeout, MAX_CONGESTION_TIMEOUT);
+        self.congestion_timeout =
+            min(self.congestion_timeout, MAX_CONGESTION_TIMEOUT);
 
         debug!("current_delay: {}", current_delay);
         debug!("delta: {}", delta);
@@ -749,8 +772,8 @@ impl UtpSocket {
 
     /// Sends a fast resend request to the remote peer.
     ///
-    /// A fast resend request consists of sending three State packets (acknowledging the last
-    /// received packet) in quick succession.
+    /// A fast resend request consists of sending three State packets
+    /// (acknowledging the last received packet) in quick succession.
     fn send_fast_resend_request(&mut self) {
         for _ in 0..3 {
             let mut packet = Packet::new();
@@ -780,8 +803,8 @@ impl UtpSocket {
                 // FIXME: Unchecked result
                 let _ = self.send_packet(&mut packet);
 
-                // We intentionally don't increase `curr_window` because otherwise a packet's length
-                // would be counted more than once
+                // We intentionally don't increase `curr_window` because
+                // otherwise a packet's length would be counted more than once
             }
         }
         debug!("---> END resend_lost_packet <---");
@@ -789,15 +812,17 @@ impl UtpSocket {
 
     /// Forgets sent packets that were acknowledged by the remote peer.
     fn advance_send_window(&mut self) {
-        // The reason I'm not removing the first element in a loop while its sequence number is
-        // smaller than `last_acked` is because of wrapping sequence numbers, which would create the
-        // sequence [..., 65534, 65535, 0, 1, ...]. If `last_acked` is smaller than the first
-        // packet's sequence number because of wraparound (for instance, 1), no packets would be
-        // removed, as the condition `seq_nr < last_acked` would fail immediately.
+        // The reason I'm not removing the first element in a loop while its
+        // sequence number is smaller than `last_acked` is because of wrapping
+        // sequence numbers, which would create the sequence [..., 65534, 65535,
+        // 0, 1, ...]. If `last_acked` is smaller than the first packet's
+        // sequence number because of wraparound (for instance, 1), no packets
+        // would be removed, as the condition `seq_nr < last_acked` would fail
+        // immediately.
         //
-        // On the other hand, I can't keep removing the first packet in a loop until its sequence
-        // number matches `last_acked` because it might never match, and in that case no packets
-        // should be removed.
+        // On the other hand, I can't keep removing the first packet in a loop
+        // until its sequence number matches `last_acked` because it might never
+        // match, and in that case no packets should be removed.
         if let Some(position) = self
             .send_window
             .iter()
@@ -814,7 +839,11 @@ impl UtpSocket {
     /// Handles an incoming packet, updating socket state accordingly.
     ///
     /// Returns the appropriate reply packet, if needed.
-    fn handle_packet(&mut self, packet: &Packet, src: SocketAddr) -> Result<Option<Packet>> {
+    fn handle_packet(
+        &mut self,
+        packet: &Packet,
+        src: SocketAddr,
+    ) -> Result<Option<Packet>> {
         debug!("({:?}, {:?})", self.state, packet.get_type());
 
         // Acknowledge only if the packet strictly follows the previous one
@@ -835,7 +864,8 @@ impl UtpSocket {
         self.remote_wnd_size = packet.wnd_size();
         debug!("self.remote_wnd_size: {}", self.remote_wnd_size);
 
-        // Update remote peer's delay between them sending the packet and us receiving it
+        // Update remote peer's delay between them sending the packet and us
+        // receiving it
         let now = now_microseconds();
         self.their_delay = abs_diff(now, packet.timestamp());
         debug!("self.their_delay: {}", self.their_delay);
@@ -852,7 +882,9 @@ impl UtpSocket {
 
                 Ok(Some(self.prepare_reply(packet, PacketType::State)))
             }
-            (_, PacketType::Syn) => Ok(Some(self.prepare_reply(packet, PacketType::Reset))),
+            (_, PacketType::Syn) => {
+                Ok(Some(self.prepare_reply(packet, PacketType::Reset)))
+            }
             (SocketState::SynSent, PacketType::State) => {
                 self.connected_to = src;
                 self.ack_nr = packet.seq_nr();
@@ -864,12 +896,15 @@ impl UtpSocket {
             }
             (SocketState::SynSent, _) => Err(SocketError::InvalidReply.into()),
             (SocketState::Connected, PacketType::Data)
-            | (SocketState::FinSent, PacketType::Data) => Ok(self.handle_data_packet(packet)),
+            | (SocketState::FinSent, PacketType::Data) => {
+                Ok(self.handle_data_packet(packet))
+            }
             (SocketState::Connected, PacketType::State) => {
                 self.handle_state_packet(packet);
                 Ok(None)
             }
-            (SocketState::Connected, PacketType::Fin) | (SocketState::FinSent, PacketType::Fin) => {
+            (SocketState::Connected, PacketType::Fin)
+            | (SocketState::FinSent, PacketType::Fin) => {
                 if packet.ack_nr() < self.seq_nr {
                     debug!("FIN received but there are missing acknowledgements for sent packets");
                 }
@@ -909,7 +944,10 @@ impl UtpSocket {
                 Err(SocketError::ConnectionReset.into())
             }
             (state, ty) => {
-                let message = format!("Unimplemented handling for ({:?},{:?})", state, ty);
+                let message = format!(
+                    "Unimplemented handling for ({:?},{:?})",
+                    state, ty
+                );
                 debug!("{}", message);
                 Err(SocketError::Other(message).into())
             }
@@ -917,7 +955,8 @@ impl UtpSocket {
     }
 
     fn handle_data_packet(&mut self, packet: &Packet) -> Option<Packet> {
-        // If a FIN was previously sent, reply with a FIN packet acknowledging the received packet.
+        // If a FIN was previously sent, reply with a FIN packet acknowledging
+        // the received packet.
         let packet_type = if self.state == SocketState::FinSent {
             PacketType::Fin
         } else {
@@ -957,27 +996,34 @@ impl UtpSocket {
 
     /// Calculates the new congestion window size, increasing it or decreasing it.
     ///
-    /// This is the core of uTP, the [LEDBAT][ledbat_rfc] congestion algorithm. It depends on
-    /// estimating the queuing delay between the two peers, and adjusting the congestion window
-    /// accordingly.
+    /// This is the core of uTP, the [LEDBAT][ledbat_rfc] congestion algorithm.
+    /// It depends on estimating the queuing delay between the two peers, and
+    /// adjusting the congestion window accordingly.
     ///
-    /// `off_target` is a normalized value representing the difference between the current queuing
-    /// delay and a fixed target delay (`TARGET`). `off_target` ranges between -1.0 and 1.0. A
-    /// positive value makes the congestion window increase, while a negative value makes the
-    /// congestion window decrease.
+    /// `off_target` is a normalized value representing the difference between
+    /// the current queuing delay and a fixed target delay (`TARGET`).
+    /// `off_target` ranges between -1.0 and 1.0. A positive value makes the
+    /// congestion window increase, while a negative value makes the congestion
+    /// window decrease.
     ///
-    /// `bytes_newly_acked` is the number of bytes acknowledged by an inbound `State` packet. It may
-    /// be the size of the packet explicitly acknowledged by the inbound packet (i.e., with sequence
-    /// number equal to the inbound packet's acknowledgement number), or every packet implicitly
-    /// acknowledged (every packet with sequence number between the previous inbound `State`
-    /// packet's acknowledgement number and the current inbound `State` packet's acknowledgement
-    /// number).
+    /// `bytes_newly_acked` is the number of bytes acknowledged by an inbound
+    /// `State` packet. It may be the size of the packet explicitly acknowledged
+    /// by the inbound packet (i.e., with sequence number equal to the inbound
+    /// packet's acknowledgement number), or every packet implicitly
+    /// acknowledged (every packet with sequence number between the previous
+    /// inbound `State` packet's acknowledgement number and the current inbound
+    /// `State` packet's acknowledgement number).
     ///
     ///[ledbat_rfc]: https://tools.ietf.org/html/rfc6817
-    fn update_congestion_window(&mut self, off_target: f64, bytes_newly_acked: u32) {
+    fn update_congestion_window(
+        &mut self,
+        off_target: f64,
+        bytes_newly_acked: u32,
+    ) {
         let flightsize = self.curr_window;
 
-        let cwnd_increase = GAIN * off_target * bytes_newly_acked as f64 * MSS as f64;
+        let cwnd_increase =
+            GAIN * off_target * bytes_newly_acked as f64 * MSS as f64;
         let cwnd_increase = cwnd_increase / self.cwnd as f64;
         debug!("cwnd_increase: {}", cwnd_increase);
 
@@ -1005,9 +1051,11 @@ impl UtpSocket {
             .iter()
             .position(|p| packet.ack_nr() == p.seq_nr())
         {
-            // Calculate the sum of the size of every packet implicitly and explicitly acknowledged
-            // by the inbound packet (i.e., every packet whose sequence number precedes the inbound
-            // packet's acknowledgement number, plus the packet whose sequence number matches)
+            // Calculate the sum of the size of every packet implicitly and
+            // explicitly acknowledged by the inbound packet (i.e., every packet
+            // whose sequence number precedes the inbound packet's
+            // acknowledgement number, plus the packet whose sequence number
+            // matches)
             let bytes_newly_acked = self
                 .send_window
                 .iter()
@@ -1021,13 +1069,14 @@ impl UtpSocket {
             self.update_base_delay(our_delay, now);
             self.update_current_delay(our_delay, now);
 
-            let off_target: f64 = (TARGET - u32::from(self.queuing_delay()) as f64) / TARGET;
+            let off_target: f64 =
+                (TARGET - u32::from(self.queuing_delay()) as f64) / TARGET;
             debug!("off_target: {}", off_target);
 
             self.update_congestion_window(off_target, bytes_newly_acked as u32);
 
-            // Update congestion timeout
-            let rtt = u32::from(our_delay - self.queuing_delay()) / 1000; // in milliseconds
+            // Update congestion timeout in milliseconds
+            let rtt = u32::from(our_delay - self.queuing_delay()) / 1000;
             self.update_congestion_timeout(rtt as i32);
         }
 
@@ -1044,7 +1093,9 @@ impl UtpSocket {
                     packet_loss_detected = true;
                 }
 
-                if let Some(last_seq_nr) = self.send_window.last().map(Packet::seq_nr) {
+                if let Some(last_seq_nr) =
+                    self.send_window.last().map(Packet::seq_nr)
+                {
                     let lost_packets = extension
                         .iter()
                         .enumerate()
@@ -1059,13 +1110,16 @@ impl UtpSocket {
                     }
                 }
             } else {
-                debug!("Unknown extension {:?}, ignoring", extension.get_type());
+                debug!(
+                    "Unknown extension {:?}, ignoring",
+                    extension.get_type()
+                );
             }
         }
 
-        // Three duplicate ACKs mean a fast resend request. Resend the first unacknowledged packet
-        // if the incoming packet doesn't have a SACK extension. If it does, the lost packets were
-        // already resent.
+        // Three duplicate ACKs mean a fast resend request. Resend the first
+        // unacknowledged packet if the incoming packet doesn't have a SACK
+        // extension. If it does, the lost packets were already resent.
         if !self.send_window.is_empty()
             && self.duplicate_ack_count == 3
             && !packet
@@ -1088,15 +1142,15 @@ impl UtpSocket {
 
     /// Inserts a packet into the socket's buffer.
     ///
-    /// The packet is inserted in such a way that the packets in the buffer are sorted according to
-    /// their sequence number in ascending order. This allows storing packets that were received out
-    /// of order.
+    /// The packet is inserted in such a way that the packets in the buffer are
+    /// sorted according to their sequence number in ascending order. This
+    /// allows storing packets that were received out of order.
     ///
     /// Trying to insert a duplicate of a packet will silently fail.
     /// it's more recent (larger timestamp).
     fn insert_into_buffer(&mut self, packet: Packet) {
-        // Immediately push to the end if the packet's sequence number comes after the last
-        // packet's.
+        // Immediately push to the end if the packet's sequence number comes
+        // after the last packet's.
         if self
             .incoming_buffer
             .last()
@@ -1104,7 +1158,8 @@ impl UtpSocket {
         {
             self.incoming_buffer.push(packet);
         } else {
-            // Find index following the most recent packet before the one we wish to insert
+            // Find index following the most recent packet before the one we
+            // wish to insert
             let i = self
                 .incoming_buffer
                 .iter()
@@ -1164,7 +1219,10 @@ impl UtpListener {
 
         // Ignore non-SYN packets
         if packet.get_type() != PacketType::Syn {
-            let message = format!("Expected SYN packet, got {:?} instead", packet.get_type());
+            let message = format!(
+                "Expected SYN packet, got {:?} instead",
+                packet.get_type()
+            );
             return Err(SocketError::Other(message).into());
         }
 
@@ -1172,8 +1230,12 @@ impl UtpListener {
 
         // The address of the new socket will depend on the type of the listener.
         let inner_socket = match addr {
-            SocketAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await,
-            SocketAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0u16)).await,
+            SocketAddr::V4(_) => {
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await
+            }
+            SocketAddr::V6(_) => {
+                UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0u16)).await
+            }
         }?;
 
         let mut socket = UtpSocket::from_raw_parts(inner_socket, src);
@@ -1184,7 +1246,10 @@ impl UtpListener {
 
             Ok((socket, src))
         } else {
-            Err(SocketError::Other("Reached unreachable statement".to_owned()).into())
+            Err(
+                SocketError::Other("Reached unreachable statement".to_owned())
+                    .into(),
+            )
         }
     }
 
@@ -1251,7 +1316,8 @@ mod test {
             match server.recv_from(&mut buf).await {
                 e => println!("{:?}", e),
             }
-            // After establishing a new connection, the server's ids are a mirror of the client's.
+            // After establishing a new connection, the server's ids are a
+            // mirror of the client's.
             assert_eq!(
                 server.receiver_connection_id,
                 server.sender_connection_id + 1
@@ -1263,7 +1329,8 @@ mod test {
 
         let mut client = iotry!(UtpSocket::connect(server_addr));
         assert_eq!(client.state, SocketState::Connected);
-        // Check proper difference in client's send connection id and receive connection id
+        // Check proper difference in client's send connection id and receive
+        // connection id
         assert_eq!(
             client.sender_connection_id,
             client.receiver_connection_id + 1
@@ -1286,7 +1353,8 @@ mod test {
         task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             assert_eq!(client.state, SocketState::Connected);
-            // Check proper difference in client's send connection id and receive connection id
+            // Check proper difference in client's send connection id and
+            // receive connection id
             assert_eq!(
                 client.sender_connection_id,
                 client.receiver_connection_id + 1
@@ -1303,7 +1371,8 @@ mod test {
         match server.recv_from(&mut buf).await {
             e => println!("{:?}", e),
         }
-        // After establishing a new connection, the server's ids are a mirror of the client's.
+        // After establishing a new connection, the server's ids are a mirror of
+        // the client's.
         assert_eq!(
             server.receiver_connection_id,
             server.sender_connection_id + 1
@@ -1326,12 +1395,14 @@ mod test {
             assert!(client.close().await.is_ok());
         });
 
-        // Make the server listen for incoming connections until the end of the input
+        // Make the server listen for incoming connections until the end of the
+        // input
         let mut buf = [0u8; BUF_SIZE];
         let _resp = server.recv_from(&mut buf).await;
         assert_eq!(server.state, SocketState::Closed);
 
-        // Trying to receive again returns `Ok(0)` (equivalent to the old `EndOfFile`)
+        // Trying to receive again returns `Ok(0)` (equivalent to the old
+        // `EndOfFile`)
         match server.recv_from(&mut buf).await {
             Ok((0, _src)) => {}
             e => panic!("Expected Ok(0), got {:?}", e),
@@ -1452,9 +1523,10 @@ mod test {
         let response = response.unwrap();
         assert_eq!(response.get_type(), PacketType::State);
 
-        // Sender (i.e., who the initiated connection and sent a SYN) has connection id equal to
-        // initial connection id + 1
-        // Receiver (i.e., who accepted connection) has connection id equal to initial connection id
+        // Sender (i.e., who the initiated connection and sent a SYN) has
+        // connection id equal to initial connection id + 1
+        // Receiver (i.e., who accepted connection) has connection id equal to
+        // initial connection id
         assert_eq!(response.connection_id(), initial_connection_id);
         assert_eq!(response.connection_id(), packet.connection_id() - 1);
 
@@ -1731,7 +1803,8 @@ mod test {
         assert_eq!(server.state, SocketState::New);
         assert_eq!(client.state, SocketState::New);
 
-        // Check proper difference in client's send connection id and receive connection id
+        // Check proper difference in client's send connection id and receive
+        // connection id
         assert_eq!(
             client.sender_connection_id,
             client.receiver_connection_id + 1
@@ -1747,7 +1820,8 @@ mod test {
 
         let mut buf = [0u8; BUF_SIZE];
         server.recv(&mut buf).await.unwrap();
-        // After establishing a new connection, the server's ids are a mirror of the client's.
+        // After establishing a new connection, the server's ids are a mirror of
+        // the client's.
         assert_eq!(
             server.receiver_connection_id,
             server.sender_connection_id + 1
@@ -1824,7 +1898,8 @@ mod test {
         assert_eq!(server.state, SocketState::New);
         assert_eq!(client.state, SocketState::New);
 
-        // Check proper difference in client's send connection id and receive connection id
+        // Check proper difference in client's send connection id and receive
+        // connection id
         assert_eq!(
             client.sender_connection_id,
             client.receiver_connection_id + 1
@@ -1857,7 +1932,8 @@ mod test {
         });
         let mut buf = [0u8; BUF_SIZE];
         iotry!(server.recv(&mut buf));
-        // After establishing a new connection, the server's ids are a mirror of the client's.
+        // After establishing a new connection, the server's ids are a mirror of
+        // the client's.
         assert_eq!(
             server.receiver_connection_id,
             server.sender_connection_id + 1
@@ -1966,7 +2042,8 @@ mod test {
         let mut client = iotry!(UtpSocket::bind(client_addr));
 
         // Advance socket's sequence number
-        client.seq_nr = ::std::u16::MAX - (to_send.len() / (BUF_SIZE * 2)) as u16;
+        client.seq_nr =
+            ::std::u16::MAX - (to_send.len() / (BUF_SIZE * 2)) as u16;
 
         task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
@@ -2044,7 +2121,9 @@ mod test {
 
         match UtpSocket::connect(server_addr).await {
             Err(ref e) if e.kind() == ErrorKind::ConnectionRefused => (), // OK
-            Err(e) => panic!("Expected ErrorKind::ConnectionRefused, got {:?}", e),
+            Err(e) => {
+                panic!("Expected ErrorKind::ConnectionRefused, got {:?}", e)
+            }
             Ok(_) => panic!("Expected Err, got Ok"),
         }
     }
@@ -2180,7 +2259,10 @@ mod test {
         let mut socket = UtpSocket::bind(addr).await.unwrap();
 
         for (timestamp, delay) in samples {
-            socket.update_base_delay(delay.into(), ((timestamp + delay) as u32).into());
+            socket.update_base_delay(
+                delay.into(),
+                ((timestamp + delay) as u32).into(),
+            );
         }
 
         let expected = vec![7i64, 9i64]
@@ -2223,7 +2305,8 @@ mod test {
         let mut server = UtpSocket::bind(server_addr).await.unwrap();
         let (tx, rx) = channel();
 
-        // `peer_addr` should return an error because the socket isn't connected yet
+        // `peer_addr` should return an error because the socket isn't connected
+        // yet
         assert!(server.peer_addr().is_err());
 
         task::spawn(async move {
@@ -2286,7 +2369,8 @@ mod test {
 
         iotry!(server.send_to(&[0]));
 
-        // Try to receive ACKs, time out too many times on flush, and fail with `TimedOut`
+        // Try to receive ACKs, time out too many times on flush, and fail with
+        // `TimedOut`
         let mut buf = [0; BUF_SIZE];
         match server.recv(&mut buf).await {
             Err(ref e) if e.kind() == ErrorKind::TimedOut => (),
