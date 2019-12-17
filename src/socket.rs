@@ -1,7 +1,10 @@
 use std::cmp::{max, min};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Result;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crate::error::SocketError;
@@ -11,6 +14,7 @@ use crate::util::*;
 
 use rand;
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::time::timeout;
 
@@ -560,11 +564,6 @@ impl UtpSocket {
         }
 
         0
-    }
-
-    /// Checks if any pending data can be read without any syscalls
-    pub(crate) fn should_read(&self) -> bool {
-        self.incoming_buffer.is_empty() && self.pending_data.is_empty()
     }
 
     /// Sends data on the socket to the remote peer. On success, returns the
@@ -1174,6 +1173,84 @@ impl UtpSocket {
                 self.incoming_buffer.insert(i, packet);
             }
         }
+    }
+}
+
+impl AsyncRead for UtpSocket
+where
+    Self: Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        let read = self.as_mut().flush_incoming_buffer(buf);
+
+        if read > 0 {
+            Poll::Ready(Ok(read))
+        } else {
+            let mut in_buf = [0u8; HEADER_SIZE + BUF_SIZE];
+
+            let (read, src) = {
+                let mut future = self.socket.recv_from(&mut in_buf);
+
+                match unsafe { Pin::new_unchecked(&mut future) }.poll(cx) {
+                    Poll::Ready(Ok((read, src))) => (read, src),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+
+            let packet = Packet::try_from(&buf[..read])?;
+
+            if let Some(reply) = self.handle_packet(&packet, src)? {
+                let mut future = self.socket.send_to(reply.as_ref(), src);
+
+                match unsafe { Pin::new_unchecked(&mut future) }.poll(cx) {
+                    Poll::Pending => return Poll::Pending, // TODO: place data in a buffer
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(_)) => {}, // all good
+                }
+            }
+
+            if packet.get_type() == PacketType::Data {
+                buf.copy_from_slice(
+                    &in_buf[HEADER_SIZE..packet.payload().len()],
+                );
+
+                Poll::Ready(Ok(packet.payload().len()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl AsyncWrite for UtpSocket
+where
+    Self: Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        unimplemented!()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        unimplemented!()
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        unimplemented!()
     }
 }
 
