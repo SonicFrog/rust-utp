@@ -2,8 +2,11 @@ use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Result;
+use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -16,6 +19,10 @@ use rand;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::sync::mpsc::{
+    unbounded_channel, UnboundedReceiver, UnboundedSender,
+};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 // For simplicity's sake, let us assume no packet will ever exceed the
@@ -783,7 +790,8 @@ impl UtpSocket {
             packet.set_connection_id(self.sender_connection_id);
             packet.set_seq_nr(self.seq_nr);
             packet.set_ack_nr(self.ack_nr);
-            let _ = self.socket.send_to(packet.as_ref(), self.connected_to);
+
+            self.unsent_queue.push_back(packet);
         }
     }
 
@@ -798,9 +806,9 @@ impl UtpSocket {
             Some(position) => {
                 debug!("self.send_window.len(): {}", self.send_window.len());
                 debug!("position: {}", position);
-                let mut packet = self.send_window[position].clone();
-                // FIXME: Unchecked result
-                let _ = self.send_packet(&mut packet);
+                let packet = self.send_window[position].clone();
+
+                self.unsent_queue.push_back(packet);
 
                 // We intentionally don't increase `curr_window` because
                 // otherwise a packet's length would be counted more than once
@@ -1176,7 +1184,172 @@ impl UtpSocket {
     }
 }
 
-impl AsyncRead for UtpSocket
+macro_rules! ready_unpin {
+    ($data:expr, $cx:expr) => {
+        match unsafe { Pin::new_unchecked($data) }.poll($cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        }
+    };
+}
+
+macro_rules! ready_try_unpin {
+    ($data:expr, $cx:expr) => {
+        match ready_unpin!($data, $cx) {
+            Ok(v) => v,
+            Err(e) => return Poll::Ready(Err(e)),
+        }
+    };
+}
+
+macro_rules! poll_unpin {
+    ($data:expr, $cx:expr) => {
+        unsafe { Pin::new_unchecked($data) }.poll($cx)
+    };
+}
+
+/// A reference to an existing `UtpSocket` that can be shared amongst multiple
+/// tasks. This can't function unless the corresponding `UtpSocketDriver` is
+/// scheduled to run on the same runtime.
+pub struct UtpSocketRef(Arc<Mutex<UtpSocket>>);
+
+impl UtpSocketRef {
+    fn new(socket: Arc<Mutex<UtpSocket>>) -> Self {
+        Self(socket)
+    }
+
+    fn from_raw_parts(socket: UdpSocket) -> Result<Self> {
+        let addr = socket.local_addr()?;
+        Ok(Self::new(Arc::new(Mutex::new(UtpSocket::from_raw_parts(
+            socket, addr,
+        )))))
+    }
+
+    /// Bind an unconnected `UtpSocket` on the given address.
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self> {
+        let udp = UdpSocket::bind(addr).await?;
+        let resolved = udp.local_addr()?;
+        let socket = UtpSocket::from_raw_parts(udp, resolved);
+        let lock = Arc::new(Mutex::new(socket));
+
+        Ok(Self::new(lock))
+    }
+
+    /// Connect to a remote host using this `UtpSocket`
+    pub async fn connect(
+        mut self,
+        dst: SocketAddr,
+    ) -> Result<(UtpStream, UtpStreamDriver)> {
+        let mut socket = self.0.lock().await;
+        let my_addr = match socket.local_addr()? {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0u16).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0u16).into(),
+        };
+        let mut socket = UtpSocket::bind(my_addr).await?;
+
+        socket.connected_to = dst;
+
+        let mut packet = Packet::new();
+        packet.set_type(PacketType::Syn);
+        packet.set_connection_id(socket.receiver_connection_id);
+        packet.set_seq_nr(socket.seq_nr);
+
+        let mut len = 0;
+        let mut buf = [0; BUF_SIZE];
+
+        let mut syn_timeout = socket.congestion_timeout;
+        for _ in 0..MAX_SYN_RETRIES {
+            packet.set_timestamp(now_microseconds());
+
+            // Send packet
+            debug!("Connecting to {}", socket.connected_to);
+            socket
+                .socket
+                .send_to(packet.as_ref(), socket.connected_to)
+                .await?;
+            socket.state = SocketState::SynSent;
+            debug!("sent {:?}", packet);
+
+            // Validate response
+            let to = Duration::from_millis(syn_timeout);
+
+            match timeout(to, socket.socket.recv_from(&mut buf)).await {
+                Ok(Ok((read, src))) => {
+                    socket.connected_to = src;
+                    len = read;
+                    break;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    debug!("Timed out, retrying");
+                    syn_timeout *= 2;
+                    continue;
+                }
+            };
+        }
+
+        let addr = socket.connected_to;
+        let packet = Packet::try_from(&buf[..len])?;
+        debug!("received {:?}", packet);
+        socket.handle_packet(&packet, addr)?;
+
+        debug!("connected to: {}", socket.connected_to);
+
+        let (tx, rx) = unbounded_channel();
+
+        let socket = Arc::new(Mutex::new(socket));
+        let driver = UtpStreamDriver::new(socket.clone(), tx);
+        let stream = UtpStream::new(socket, rx);
+
+        Ok((stream, driver))
+    }
+
+    /// Accept an incoming connection using this `UtpSocket`. This also
+    /// returns a `UtpStreamDriver` that must be scheduled on a runtime
+    /// in order for the associated `UtpStream` to work properly.
+    /// Accepting a new connection will consume this listener.
+    pub async fn accept(self) -> Result<(UtpStream, UtpStreamDriver)> {
+        {
+            let mut socket = self.0.lock().await;
+            let mut buf = [0u8; BUF_SIZE];
+
+            socket.recv_from(&mut buf).await?;
+        }
+
+        let (tx, rx) = unbounded_channel();
+        let socket = self.0;
+        let stream = UtpStream::new(socket.clone(), rx);
+        let driver = UtpStreamDriver::new(socket, tx);
+
+        Ok((stream, driver))
+    }
+}
+
+/// A `UtpStream` that can be used to read and write in a more convenient
+/// fashion with the `AsyncRead` and `AsyncWrite` traits.
+pub struct UtpStream {
+    socket: Arc<Mutex<UtpSocket>>,
+    receiver: UnboundedReceiver<bool>,
+}
+
+impl UtpStream {
+    fn new(
+        socket: Arc<Mutex<UtpSocket>>,
+        receiver: UnboundedReceiver<bool>,
+    ) -> Self {
+        Self { socket, receiver }
+    }
+}
+
+impl Deref for UtpStream {
+    type Target = Mutex<UtpSocket>;
+
+    fn deref(&self) -> &Self::Target {
+        self.socket.deref()
+    }
+}
+
+impl AsyncRead for UtpStream
 where
     Self: Unpin,
 {
@@ -1185,49 +1358,25 @@ where
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        let read = self.as_mut().flush_incoming_buffer(buf);
+        let read =
+            ready_unpin!(&mut self.lock(), cx).flush_incoming_buffer(buf);
 
         if read > 0 {
             Poll::Ready(Ok(read))
         } else {
-            let mut in_buf = [0u8; HEADER_SIZE + BUF_SIZE];
-
-            let (read, src) = {
-                let mut future = self.socket.recv_from(&mut in_buf);
-
-                match unsafe { Pin::new_unchecked(&mut future) }.poll(cx) {
-                    Poll::Ready(Ok((read, src))) => (read, src),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+            // make this wake up when data is received by the driver
+            match poll_unpin!(&mut self.receiver.recv(), cx) {
+                // either driver sender was dropped or disconnection notice
+                Poll::Ready(None) | Poll::Ready(Some(true)) => {
+                    Poll::Ready(Ok(0))
                 }
-            };
-
-            let packet = Packet::try_from(&buf[..read])?;
-
-            if let Some(reply) = self.handle_packet(&packet, src)? {
-                let mut future = self.socket.send_to(reply.as_ref(), src);
-
-                match unsafe { Pin::new_unchecked(&mut future) }.poll(cx) {
-                    Poll::Pending => return Poll::Pending, // TODO: place data in a buffer
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(_)) => {}, // all good
-                }
-            }
-
-            if packet.get_type() == PacketType::Data {
-                buf.copy_from_slice(
-                    &in_buf[HEADER_SIZE..packet.payload().len()],
-                );
-
-                Poll::Ready(Ok(packet.payload().len()))
-            } else {
-                Poll::Pending
+                _ => Poll::Pending,
             }
         }
     }
 }
 
-impl AsyncWrite for UtpSocket
+impl AsyncWrite for UtpStream
 where
     Self: Unpin,
 {
@@ -1236,6 +1385,9 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize>> {
+        let mut socket = ready_unpin!(&mut self.lock(), cx);
+        let packet = Packet::with_payload(buf);
+
         unimplemented!()
     }
 
@@ -1243,14 +1395,94 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<()>> {
-        unimplemented!()
+        let mut socket = ready_unpin!(&mut self.lock(), cx);
+
+        while let Some(packet) = socket.unsent_queue.pop_front() {
+            // put all unset packets in send_window
+        }
+
+        while !socket.send_window.is_empty() {
+            // send all packets and wait for acks
+            unimplemented!()
+        }
+
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<()>> {
+        let socket = ready_unpin!(&mut self.lock(), cx);
+
         unimplemented!()
+    }
+}
+
+#[must_use = "stream drivers must be spawned for the stream to work"]
+/// This is a `Future` that takes care of handling all events related to
+/// a `UtpStream`. `UtpStream` won't receive neither send any data until this
+/// driver is spawned as a tokio task.
+pub struct UtpStreamDriver {
+    socket: Arc<Mutex<UtpSocket>>,
+    sender: UnboundedSender<bool>,
+}
+
+impl UtpStreamDriver {
+    fn new(
+        socket: Arc<Mutex<UtpSocket>>,
+        sender: UnboundedSender<bool>,
+    ) -> Self {
+        Self { socket, sender }
+    }
+}
+
+impl Future for UtpStreamDriver {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let mut socket = ready_unpin!(&mut self.socket.lock(), cx);
+        let mut buf = [0u8; BUF_SIZE + HEADER_SIZE];
+
+        loop {
+            if socket.state == SocketState::Closed {
+                mem::drop(socket); // socket is closed
+
+                if let Err(_) = self.sender.send(true) {
+                    error!("failed to notify socket of termination");
+                }
+
+                return Poll::Ready(Ok(()));
+            }
+
+            let (read, src) = {
+                let mut future = socket.socket.recv_from(&mut buf);
+                ready_try_unpin!(&mut future, cx)
+            };
+
+            if let Ok(packet) = Packet::try_from(&buf[..read]) {
+                debug!("received packet {:?}", packet);
+
+                if let Ok(Some(mut reply)) = socket.handle_packet(&packet, src)
+                {
+                    match packet.get_type() {
+                        PacketType::Data => socket.insert_into_buffer(packet),
+                        _ => {}
+                    }
+
+                    ready_try_unpin!(&mut socket.send_packet(&mut reply), cx);
+                } else {
+                    // state packets may trigger retransmits
+                    match packet.get_type() {
+                        PacketType::State => {
+                            // flush unset packets if any
+                            ready_try_unpin!(&mut socket.send(), cx)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1341,12 +1573,13 @@ mod test {
     use std::io::ErrorKind;
     use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 
-    use crate::packet::*;
+    use super::*;
     use crate::socket::{SocketState, UtpListener, UtpSocket, BUF_SIZE};
     use crate::time::now_microseconds;
 
     use rand;
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task;
 
     macro_rules! iotry {
@@ -1379,6 +1612,46 @@ mod test {
             0,
             0,
         ))
+    }
+
+    #[tokio::test]
+    async fn test_stream_connection() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        task::spawn(async move {
+            let (mut stream, driver) = UtpSocketRef::bind(server_addr)
+                .await
+                .expect("failed to bind")
+                .accept()
+                .await
+                .expect("failed to accept");
+
+            task::spawn(driver);
+
+            let mut buf = [0u8; 256];
+
+            let read = stream.read(&mut buf).await.expect("failed to read");
+
+            for b in &buf[..read] {
+                assert_eq!(*b, 1, "data was altered");
+            }
+        });
+
+        let socket = UtpSocketRef::bind(client_addr)
+            .await
+            .expect("failed to bind");
+        let (mut stream, driver) = socket
+            .connect(server_addr)
+            .await
+            .expect("failed to connect");
+        let buf = [1u8; 256];
+
+        let read = stream.write(&buf).await.expect("failed to write");
+
+        assert_eq!(read, buf.len(), "wrote wrong number of bytes");
+
+        task::spawn(driver);
     }
 
     #[tokio::test]
