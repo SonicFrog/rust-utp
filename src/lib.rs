@@ -1,10 +1,10 @@
 //! Implementation of the [Micro Transport Protocol][spec].
 //!
-//! This library provides both a socket interface (`UtpSocket`) and a stream interface
-//! (`UtpStream`).
-//! I recommend that you use `UtpStream`, as it implements the `Read` and `Write`
-//! traits we all know (and love) from `std::io`, which makes it generally easier to work with than
-//! `UtpSocket`.
+//! This library provides both a socket interface (`UtpSocket`) and a stream
+//! interface (`UtpStream`).
+//! I recommend that you use `UtpStream`, as it implements the `Read` and
+//! `Write` traits we all know (and love) from `std::io`, which makes it
+//! generally easier to work with than `UtpSocket`.
 //!
 //! [spec]: http://www.bittorrent.org/beps/bep_0029.html
 //!
@@ -36,13 +36,13 @@ extern crate log;
 
 // Public API
 pub use socket::UtpListener;
-pub use socket::UtpSocket;
-pub use stream::UtpStream;
+pub use socket::UtpSocketRef as UtpSocket;
+pub use socket::UtpStream;
+pub use socket::UtpStreamDriver;
 
 mod bit_iterator;
 mod error;
 mod packet;
 mod socket;
-mod stream;
 mod time;
 mod util;
