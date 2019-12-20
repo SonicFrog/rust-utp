@@ -1381,14 +1381,25 @@ where
     Self: Unpin,
 {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize>> {
         let mut socket = ready_unpin!(&mut self.lock(), cx);
-        let packet = Packet::with_payload(buf);
 
-        unimplemented!()
+        for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
+            let mut packet = Packet::with_payload(chunk);
+            packet.set_seq_nr(socket.seq_nr);
+            packet.set_ack_nr(socket.ack_nr);
+            packet.set_connection_id(socket.sender_connection_id);
+
+            socket.unsent_queue.push_back(packet);
+
+            // Intentionally wrap around sequence number
+            socket.seq_nr = socket.seq_nr.wrapping_add(1);
+        }
+
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(
@@ -1614,21 +1625,40 @@ mod test {
         ))
     }
 
+    async fn stream_accept(server_addr: SocketAddr) -> UtpStream {
+        let (stream, driver) = UtpSocketRef::bind(server_addr)
+            .await
+            .expect("failed to bind")
+            .accept()
+            .await
+            .expect("failed to accept");
+
+        task::spawn(driver);
+
+        stream
+    }
+
+    async fn stream_connect(local: SocketAddr, peer: SocketAddr) -> UtpStream {
+        let socket = UtpSocketRef::bind(local)
+            .await
+            .expect("failed to bind");
+        let (mut stream, driver) = socket
+            .connect(peer)
+            .await
+            .expect("failed to connect");
+
+        task::spawn(driver);
+
+        stream
+    }
+
     #[tokio::test]
     async fn test_stream_connection() {
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
         task::spawn(async move {
-            let (mut stream, driver) = UtpSocketRef::bind(server_addr)
-                .await
-                .expect("failed to bind")
-                .accept()
-                .await
-                .expect("failed to accept");
-
-            task::spawn(driver);
-
+            let mut stream = stream_accept(server_addr).await;
             let mut buf = [0u8; 256];
 
             let read = stream.read(&mut buf).await.expect("failed to read");
@@ -1638,20 +1668,16 @@ mod test {
             }
         });
 
-        let socket = UtpSocketRef::bind(client_addr)
-            .await
-            .expect("failed to bind");
-        let (mut stream, driver) = socket
-            .connect(server_addr)
-            .await
-            .expect("failed to connect");
+        let mut stream = stream_connect(client_addr, server_addr).await;
         let buf = [1u8; 256];
-
         let read = stream.write(&buf).await.expect("failed to write");
 
         assert_eq!(read, buf.len(), "wrote wrong number of bytes");
+    }
 
-        task::spawn(driver);
+    #[tokio::test]
+    async fn test_stream_big_buffer() {
+
     }
 
     #[tokio::test]
