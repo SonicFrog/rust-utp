@@ -12,7 +12,7 @@ version = "0.8.0"
 edition = "2018"
 
 [dependencies]
-tokio = { version = "0.2.4", features = [ "udp", "time", "macros", "rt-core", "io-util" ] }
+tokio = { version = "0.2.4", features = [ "udp", "time", "macros", "rt-core", "io-util", "sync" ] }
 log = "0.3"
 num-traits = "0.1"
 rand = "0.3"
