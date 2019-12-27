@@ -1540,7 +1540,6 @@ impl Future for UtpStreamDriver {
             }
 
             match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
-                Poll::Ready(Ok((0, _))) => return Poll::Ready(Ok(())),
                 Poll::Ready(Ok((read, src))) => {
                     if let Ok(packet) = Packet::try_from(&buf[..read]) {
                         debug!("received packet {:?}", packet);
