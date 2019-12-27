@@ -1579,6 +1579,7 @@ impl Future for UtpStreamDriver {
                     mem::drop(socket);
 
                     if let Poll::Ready(_) = self.timer.poll_tick(cx) {
+                        debug!("receive timeout detected");
                         self.timer =
                             interval(Duration::from_millis(next_timeout));
                         let mut socket = ready_unpin!(self.socket.lock(), cx);
@@ -1808,6 +1809,8 @@ mod test {
             for _ in 0..2 {
                 stream.read_exact(&mut buf).await.expect("failed to read");
             }
+
+            stream.shutdown().await.expect("failed to shutdown");
         });
 
         let mut stream = stream_connect(client_addr, server_addr).await;
