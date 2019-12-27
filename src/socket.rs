@@ -1519,10 +1519,6 @@ impl UtpStreamDriver {
             timer: interval(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
         }
     }
-
-    fn poll_timeout(_timer: &mut Interval) -> Poll<()> {
-        todo!("poll timeout")
-    }
 }
 
 impl Future for UtpStreamDriver {
