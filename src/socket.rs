@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::Mutex;
-use tokio::time::timeout;
+use tokio::time::{interval, timeout, Interval};
 
 // For simplicity's sake, let us assume no packet will ever exceed the
 // Ethernet maximum transfer unit of 1500 bytes.
@@ -1184,15 +1184,19 @@ impl UtpSocket {
     }
 }
 
+/// Polls a `Future` and returns from current function unless the future is
+/// `Ready`
 macro_rules! ready_unpin {
     ($data:expr, $cx:expr) => {
-        match unsafe { Pin::new_unchecked($data) }.poll($cx) {
+        match unsafe { Pin::new_unchecked(&mut $data) }.poll($cx) {
             Poll::Ready(v) => v,
             Poll::Pending => return Poll::Pending,
         }
     };
 }
 
+/// Polls a `Future` that returns a `Result` and returns from the current
+/// function unless the feature is `Ready` and the `Result` is `Ok`
 macro_rules! ready_try_unpin {
     ($data:expr, $cx:expr) => {
         match ready_unpin!($data, $cx) {
@@ -1202,10 +1206,12 @@ macro_rules! ready_try_unpin {
     };
 }
 
+/// Polls a `Future` while ensuring pinning
 macro_rules! poll_unpin {
-    ($data:expr, $cx:expr) => {
-        unsafe { Pin::new_unchecked($data) }.poll($cx)
-    };
+    ($data:expr, $cx:expr) => {{
+        let x = unsafe { Pin::new_unchecked(&mut $data) }.poll($cx);
+        x
+    }};
 }
 
 /// A reference to an existing `UtpSocket` that can be shared amongst multiple
@@ -1216,13 +1222,6 @@ pub struct UtpSocketRef(Arc<Mutex<UtpSocket>>);
 impl UtpSocketRef {
     fn new(socket: Arc<Mutex<UtpSocket>>) -> Self {
         Self(socket)
-    }
-
-    fn from_raw_parts(socket: UdpSocket) -> Result<Self> {
-        let addr = socket.local_addr()?;
-        Ok(Self::new(Arc::new(Mutex::new(UtpSocket::from_raw_parts(
-            socket, addr,
-        )))))
     }
 
     /// Bind an unconnected `UtpSocket` on the given address.
@@ -1237,10 +1236,10 @@ impl UtpSocketRef {
 
     /// Connect to a remote host using this `UtpSocket`
     pub async fn connect(
-        mut self,
+        self,
         dst: SocketAddr,
     ) -> Result<(UtpStream, UtpStreamDriver)> {
-        let mut socket = self.0.lock().await;
+        let socket = self.0.lock().await;
         let my_addr = match socket.local_addr()? {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0u16).into(),
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0u16).into(),
@@ -1358,14 +1357,13 @@ where
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        let read =
-            ready_unpin!(&mut self.lock(), cx).flush_incoming_buffer(buf);
+        let read = ready_unpin!(self.lock(), cx).flush_incoming_buffer(buf);
 
         if read > 0 {
             Poll::Ready(Ok(read))
         } else {
             // make this wake up when data is received by the driver
-            match poll_unpin!(&mut self.receiver.recv(), cx) {
+            match poll_unpin!(self.receiver.recv(), cx) {
                 // either driver sender was dropped or disconnection notice
                 Poll::Ready(None) | Poll::Ready(Some(true)) => {
                     Poll::Ready(Ok(0))
@@ -1385,36 +1383,101 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize>> {
-        let mut socket = ready_unpin!(&mut self.lock(), cx);
+        let mut socket = ready_unpin!(self.lock(), cx);
+
+        if socket.state == SocketState::Closed {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut sent: usize = 0;
 
         for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
             let mut packet = Packet::with_payload(chunk);
+
             packet.set_seq_nr(socket.seq_nr);
             packet.set_ack_nr(socket.ack_nr);
             packet.set_connection_id(socket.sender_connection_id);
 
-            socket.unsent_queue.push_back(packet);
+            match poll_unpin!(socket.send_packet(&mut packet), cx) {
+                Poll::Pending if sent == 0 => return Poll::Pending,
+                Poll::Ready(Err(e)) if sent == 0 => return Poll::Ready(Err(e)),
+                Poll::Pending | Poll::Ready(Err(_)) => {
+                    return Poll::Ready(Ok(sent))
+                }
 
-            // Intentionally wrap around sequence number
-            socket.seq_nr = socket.seq_nr.wrapping_add(1);
+                Poll::Ready(Ok(())) => {
+                    let dst = socket.connected_to;
+                    let written = match poll_unpin!(
+                        socket.socket.send_to(packet.as_ref(), dst),
+                        cx
+                    ) {
+                        Poll::Pending => 0,
+                        Poll::Ready(Err(_e)) => todo!("error handling"),
+                        Poll::Ready(Ok(written)) => written,
+                    };
+
+                    if written > 0 {
+                        socket.curr_window += written as u32;
+                        socket.send_window.push(packet);
+                    }
+
+                    sent += written;
+                    socket.seq_nr = socket.seq_nr.wrapping_add(1);
+                }
+            }
         }
 
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<Result<()>> {
-        let mut socket = ready_unpin!(&mut self.lock(), cx);
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        let mut socket = ready_unpin!(self.lock(), cx);
 
-        while let Some(packet) = socket.unsent_queue.pop_front() {
-            // put all unset packets in send_window
+        while let Some(mut packet) = socket.unsent_queue.pop_front() {
+            if let Poll::Pending =
+                poll_unpin!(socket.send_packet(&mut packet), cx)
+            {
+                return Poll::Pending;
+            }
+
+            let result = {
+                let dst = socket.connected_to.clone();
+                poll_unpin!(socket.socket.send_to(packet.as_ref(), dst), cx)
+            };
+
+            match result {
+                Poll::Pending => {
+                    socket.unsent_queue.push_front(packet);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(_)) => socket.send_window.push(packet),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            }
         }
+
+        let mut buf = [0u8; BUF_SIZE];
 
         while !socket.send_window.is_empty() {
             // send all packets and wait for acks
-            unimplemented!()
+
+            let (read, src) = {
+                match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
+                    Poll::Ready(Ok((read, src))) => (read, src),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+
+            let packet = Packet::try_from(&buf[..read])?;
+
+            if let Some(reply) = socket.handle_packet(&packet, src)? {
+                if let Poll::Pending =
+                    poll_unpin!(socket.socket.send_to(reply.as_ref(), src), cx)
+                {
+                    socket.unsent_queue.push_back(reply);
+                    return Poll::Pending;
+                }
+            }
         }
 
         Poll::Ready(Ok(()))
@@ -1424,9 +1487,14 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<()>> {
-        let socket = ready_unpin!(&mut self.lock(), cx);
+        if let Poll::Pending = self.as_mut().poll_flush(cx) {
+            Poll::Pending
+        } else {
+            let mut socket = ready_unpin!(self.lock(), cx);
+            let result = ready_unpin!(socket.close(), cx);
 
-        unimplemented!()
+            Poll::Ready(result)
+        }
     }
 }
 
@@ -1437,6 +1505,7 @@ where
 pub struct UtpStreamDriver {
     socket: Arc<Mutex<UtpSocket>>,
     sender: UnboundedSender<bool>,
+    timer: Interval,
 }
 
 impl UtpStreamDriver {
@@ -1444,7 +1513,15 @@ impl UtpStreamDriver {
         socket: Arc<Mutex<UtpSocket>>,
         sender: UnboundedSender<bool>,
     ) -> Self {
-        Self { socket, sender }
+        Self {
+            socket,
+            sender,
+            timer: interval(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
+        }
+    }
+
+    fn poll_timeout(_timer: &mut Interval) -> Poll<()> {
+        todo!("poll timeout")
     }
 }
 
@@ -1452,7 +1529,7 @@ impl Future for UtpStreamDriver {
     type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut socket = ready_unpin!(&mut self.socket.lock(), cx);
+        let mut socket = ready_unpin!(self.socket.lock(), cx);
         let mut buf = [0u8; BUF_SIZE + HEADER_SIZE];
 
         loop {
@@ -1466,31 +1543,54 @@ impl Future for UtpStreamDriver {
                 return Poll::Ready(Ok(()));
             }
 
-            let (read, src) = {
-                let mut future = socket.socket.recv_from(&mut buf);
-                ready_try_unpin!(&mut future, cx)
-            };
+            match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
+                Poll::Ready(Ok((0, _))) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok((read, src))) => {
+                    if let Ok(packet) = Packet::try_from(&buf[..read]) {
+                        debug!("received packet {:?}", packet);
 
-            if let Ok(packet) = Packet::try_from(&buf[..read]) {
-                debug!("received packet {:?}", packet);
+                        match socket.handle_packet(&packet, src) {
+                            Ok(Some(mut reply)) => {
+                                match packet.get_type() {
+                                    PacketType::Data => {
+                                        socket.insert_into_buffer(packet)
+                                    }
+                                    _ => {}
+                                }
 
-                if let Ok(Some(mut reply)) = socket.handle_packet(&packet, src)
-                {
-                    match packet.get_type() {
-                        PacketType::Data => socket.insert_into_buffer(packet),
-                        _ => {}
-                    }
+                                ready_try_unpin!(
+                                    socket.send_packet(&mut reply),
+                                    cx
+                                );
+                                let dst = socket.connected_to;
 
-                    ready_try_unpin!(&mut socket.send_packet(&mut reply), cx);
-                } else {
-                    // state packets may trigger retransmits
-                    match packet.get_type() {
-                        PacketType::State => {
-                            // flush unset packets if any
-                            ready_try_unpin!(&mut socket.send(), cx)
+                                if let Poll::Pending = poll_unpin!(
+                                    socket.socket.send_to(reply.as_ref(), dst),
+                                    cx
+                                ) {
+                                    socket.unsent_queue.push_back(reply);
+                                    return Poll::Pending;
+                                }
+                            }
+                            Ok(None) => ready_try_unpin!(socket.send(), cx),
+                            Err(e) => return Poll::Ready(Err(e)),
                         }
-                        _ => {}
                     }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    let next_timeout = socket.congestion_timeout * 2;
+
+                    mem::drop(socket);
+
+                    if let Poll::Ready(_) = self.timer.poll_tick(cx) {
+                        self.timer =
+                            interval(Duration::from_millis(next_timeout));
+                        let mut socket = ready_unpin!(self.socket.lock(), cx);
+                        ready_try_unpin!(socket.handle_receive_timeout(), cx);
+                    }
+
+                    return Poll::Pending;
                 }
             }
         }
@@ -1639,13 +1739,9 @@ mod test {
     }
 
     async fn stream_connect(local: SocketAddr, peer: SocketAddr) -> UtpStream {
-        let socket = UtpSocketRef::bind(local)
-            .await
-            .expect("failed to bind");
-        let (mut stream, driver) = socket
-            .connect(peer)
-            .await
-            .expect("failed to connect");
+        let socket = UtpSocketRef::bind(local).await.expect("failed to bind");
+        let (stream, driver) =
+            socket.connect(peer).await.expect("failed to connect");
 
         task::spawn(driver);
 
@@ -1661,23 +1757,71 @@ mod test {
             let mut stream = stream_accept(server_addr).await;
             let mut buf = [0u8; 256];
 
-            let read = stream.read(&mut buf).await.expect("failed to read");
+            let read =
+                stream.read_exact(&mut buf).await.expect("failed to read");
 
             for b in &buf[..read] {
                 assert_eq!(*b, 1, "data was altered");
             }
+
+            stream.shutdown().await.expect("failed to close");
         });
 
         let mut stream = stream_connect(client_addr, server_addr).await;
         let buf = [1u8; 256];
-        let read = stream.write(&buf).await.expect("failed to write");
-
-        assert_eq!(read, buf.len(), "wrote wrong number of bytes");
+        stream.write_all(&buf).await.expect("failed to write");
+        stream.shutdown().await.expect("failed to close connection");
     }
 
     #[tokio::test]
-    async fn test_stream_big_buffer() {
+    async fn test_stream_packet_split() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+        const LEN: usize = 2000;
+        const DATA: u8 = 1;
 
+        task::spawn(async move {
+            let mut stream = stream_accept(server_addr).await;
+            let mut buf = [0u8; LEN];
+
+            stream.read_exact(&mut buf).await.expect("failed to read");
+
+            for b in &buf[..] {
+                assert_eq!(*b, DATA, "data was altered");
+            }
+        });
+
+        let mut stream = stream_connect(client_addr, server_addr).await;
+        let buf = [DATA; LEN];
+
+        stream.write_all(&buf).await.expect("failed to write");
+        stream.shutdown().await.expect("failed to close");
+    }
+
+    #[tokio::test]
+    async fn test_stream_flush_then_send() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        const LEN: usize = 1240;
+        const DATA: u8 = 25;
+
+        task::spawn(async move {
+            let mut stream = stream_accept(server_addr).await;
+            let mut buf = [0u8; LEN];
+
+            for _ in 0..2 {
+                stream.read_exact(&mut buf).await.expect("failed to read");
+            }
+        });
+
+        let mut stream = stream_connect(client_addr, server_addr).await;
+        let buf = [DATA; LEN];
+
+        stream.write_all(&buf).await.expect("failed to write");
+        stream.flush().await.expect("failed to flush");
+        stream.write_all(&buf).await.expect("failed to write");
+        stream.shutdown().await.expect("failed to shutdown");
     }
 
     #[tokio::test]
