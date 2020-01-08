@@ -1209,6 +1209,7 @@ macro_rules! ready_try_unpin {
 /// Polls a `Future` while ensuring pinning
 macro_rules! poll_unpin {
     ($data:expr, $cx:expr) => {{
+        #[allow()]
         let x = unsafe { Pin::new_unchecked(&mut $data) }.poll($cx);
         x
     }};
@@ -1217,11 +1218,11 @@ macro_rules! poll_unpin {
 /// A reference to an existing `UtpSocket` that can be shared amongst multiple
 /// tasks. This can't function unless the corresponding `UtpSocketDriver` is
 /// scheduled to run on the same runtime.
-pub struct UtpSocketRef(Arc<Mutex<UtpSocket>>);
+pub struct UtpSocketRef(Arc<Mutex<UtpSocket>>, SocketAddr);
 
 impl UtpSocketRef {
-    fn new(socket: Arc<Mutex<UtpSocket>>) -> Self {
-        Self(socket)
+    fn new(socket: Arc<Mutex<UtpSocket>>, local: SocketAddr) -> Self {
+        Self(socket, local)
     }
 
     /// Bind an unconnected `UtpSocket` on the given address.
@@ -1231,7 +1232,9 @@ impl UtpSocketRef {
         let socket = UtpSocket::from_raw_parts(udp, resolved);
         let lock = Arc::new(Mutex::new(socket));
 
-        Ok(Self::new(lock))
+        debug!("bound utp socket on {}", resolved);
+
+        Ok(Self::new(lock, resolved))
     }
 
     /// Connect to a remote host using this `UtpSocket`
@@ -1287,18 +1290,19 @@ impl UtpSocketRef {
             };
         }
 
-        let addr = socket.connected_to;
+        let remote = socket.connected_to;
         let packet = Packet::try_from(&buf[..len])?;
         debug!("received {:?}", packet);
-        socket.handle_packet(&packet, addr)?;
+        socket.handle_packet(&packet, remote)?;
 
         debug!("connected to: {}", socket.connected_to);
 
         let (tx, rx) = unbounded_channel();
 
+        let local = socket.local_addr()?;
         let socket = Arc::new(Mutex::new(socket));
         let driver = UtpStreamDriver::new(socket.clone(), tx);
-        let stream = UtpStream::new(socket, rx);
+        let stream = UtpStream::new(socket, rx, local, remote);
 
         Ok((stream, driver))
     }
@@ -1308,19 +1312,26 @@ impl UtpSocketRef {
     /// in order for the associated `UtpStream` to work properly.
     /// Accepting a new connection will consume this listener.
     pub async fn accept(self) -> Result<(UtpStream, UtpStreamDriver)> {
-        {
+        let (src, dst) = {
             let mut socket = self.0.lock().await;
             let mut buf = [0u8; BUF_SIZE];
 
             socket.recv_from(&mut buf).await?;
-        }
+
+            (socket.socket.local_addr()?, socket.connected_to)
+        };
 
         let (tx, rx) = unbounded_channel();
         let socket = self.0;
-        let stream = UtpStream::new(socket.clone(), rx);
+        let stream = UtpStream::new(socket.clone(), rx, src, dst);
         let driver = UtpStreamDriver::new(socket, tx);
 
         Ok((stream, driver))
+    }
+
+    /// Get the local address for this `UtpSocket`
+    pub fn local_addr(&self) -> SocketAddr {
+        self.1
     }
 }
 
@@ -1329,14 +1340,33 @@ impl UtpSocketRef {
 pub struct UtpStream {
     socket: Arc<Mutex<UtpSocket>>,
     receiver: UnboundedReceiver<bool>,
+    local: SocketAddr,
+    remote: SocketAddr,
 }
 
 impl UtpStream {
     fn new(
         socket: Arc<Mutex<UtpSocket>>,
         receiver: UnboundedReceiver<bool>,
+        local: SocketAddr,
+        remote: SocketAddr,
     ) -> Self {
-        Self { socket, receiver }
+        Self {
+            socket,
+            receiver,
+            local,
+            remote,
+        }
+    }
+
+    /// Get the local address used by this `UtpStream`
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// Get the address of the remote end of this `UtpStream`
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.remote
     }
 }
 
@@ -1357,15 +1387,30 @@ where
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        let read = ready_unpin!(self.lock(), cx).flush_incoming_buffer(buf);
+        debug!("read poll for {} bytes", buf.len());
+
+        let (read, state) = {
+            let mut socket = ready_unpin!(self.lock(), cx);
+
+            (socket.flush_incoming_buffer(buf), socket.state)
+        };
 
         if read > 0 {
+            debug!("flushed {} bytes of received data", read);
             Poll::Ready(Ok(read))
+        } else if state == SocketState::Closed {
+            debug!("read on closed connectio");
+            Poll::Ready(Ok(0))
+        } else if state == SocketState::ResetReceived {
+            debug!("read on reset connection");
+            Poll::Ready(Err(SocketError::ConnectionReset.into()))
         } else {
             // make this wake up when data is received by the driver
+            debug!("waiting on connection driver to fetch new data");
             match poll_unpin!(self.receiver.recv(), cx) {
                 // either driver sender was dropped or disconnection notice
                 Poll::Ready(None) | Poll::Ready(Some(true)) => {
+                    debug!("connection driver has died");
                     Poll::Ready(Ok(0))
                 }
                 _ => Poll::Pending,
@@ -1386,12 +1431,16 @@ where
         let mut socket = ready_unpin!(self.lock(), cx);
 
         if socket.state == SocketState::Closed {
+            debug!("writing on closed connection");
             return Poll::Ready(Ok(0));
         }
 
         let mut sent: usize = 0;
 
+        debug!("trying to send {} bytes", buf.len());
+
         for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
+            debug!("attempting to send chunk of {} byte", chunk.len());
             let mut packet = Packet::with_payload(chunk);
 
             packet.set_seq_nr(socket.seq_nr);
@@ -1399,10 +1448,17 @@ where
             packet.set_connection_id(socket.sender_connection_id);
 
             match poll_unpin!(socket.send_packet(&mut packet), cx) {
-                Poll::Pending if sent == 0 => return Poll::Pending,
-                Poll::Ready(Err(e)) if sent == 0 => return Poll::Ready(Err(e)),
+                Poll::Pending if sent == 0 => {
+                    debug!("socket buffer is full, waiting");
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) if sent == 0 => {
+                    debug!("os error reading data: {}", e);
+                    return Poll::Ready(Err(e));
+                }
                 Poll::Pending | Poll::Ready(Err(_)) => {
-                    return Poll::Ready(Ok(sent))
+                    debug!("successfully sent {} bytes, sleeping...", sent);
+                    return Poll::Ready(Ok(sent));
                 }
 
                 Poll::Ready(Ok(())) => {
@@ -1413,13 +1469,15 @@ where
                     ) {
                         Poll::Pending => 0,
                         Poll::Ready(Err(_e)) => todo!("error handling"),
-                        Poll::Ready(Ok(written)) => written,
+                        Poll::Ready(Ok(written)) if written == 0 => continue,
+                        Poll::Ready(Ok(written)) => {
+                            debug!("sent packet of {} bytes", written);
+                            written
+                        }
                     };
 
-                    if written > 0 {
-                        socket.curr_window += written as u32;
-                        socket.send_window.push(packet);
-                    }
+                    socket.curr_window += written as u32;
+                    socket.send_window.push(packet);
 
                     sent += written;
                     socket.seq_nr = socket.seq_nr.wrapping_add(1);
@@ -1433,15 +1491,18 @@ where
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
         let mut socket = ready_unpin!(self.lock(), cx);
 
+        debug!("flush attempt");
+
         while let Some(mut packet) = socket.unsent_queue.pop_front() {
             if let Poll::Pending =
                 poll_unpin!(socket.send_packet(&mut packet), cx)
             {
+                debug!("too many in flight packets, waiting for ack");
                 return Poll::Pending;
             }
 
             let result = {
-                let dst = socket.connected_to.clone();
+                let dst = socket.connected_to;
                 poll_unpin!(socket.socket.send_to(packet.as_ref(), dst), cx)
             };
 
@@ -1455,11 +1516,11 @@ where
             }
         }
 
+        debug!("unsent queue cleared");
+
         let mut buf = [0u8; BUF_SIZE];
 
         while !socket.send_window.is_empty() {
-            // send all packets and wait for acks
-
             let (read, src) = {
                 match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
                     Poll::Ready(Ok((read, src))) => (read, src),
@@ -1480,6 +1541,7 @@ where
             }
         }
 
+        debug!("succesfully flushed");
         Poll::Ready(Ok(()))
     }
 
@@ -1519,20 +1581,35 @@ impl UtpStreamDriver {
             timer: interval(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
         }
     }
+
+    async fn handle_timeout(&mut self, next_timeout: u64) -> Result<()> {
+        let ret = {
+            let mut socket = self.socket.lock().await;
+            socket.handle_receive_timeout().await
+        };
+
+        self.timer = interval(Duration::from_millis(next_timeout));
+
+        ret
+    }
 }
 
 impl Future for UtpStreamDriver {
     type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let sender = self.sender.clone();
         let mut socket = ready_unpin!(self.socket.lock(), cx);
         let mut buf = [0u8; BUF_SIZE + HEADER_SIZE];
+        let _timeout = Duration::from_millis(socket.congestion_timeout);
 
         loop {
+            debug!("stream driver poll attempt");
             if socket.state == SocketState::Closed {
+                debug!("socket is closing");
                 mem::drop(socket); // socket is closed
 
-                if let Err(_) = self.sender.send(true) {
+                if self.sender.send(true).is_err() {
                     error!("failed to notify socket of termination");
                 }
 
@@ -1546,17 +1623,21 @@ impl Future for UtpStreamDriver {
 
                         match socket.handle_packet(&packet, src) {
                             Ok(Some(mut reply)) => {
-                                match packet.get_type() {
-                                    PacketType::Data => {
-                                        socket.insert_into_buffer(packet)
+                                if let PacketType::Data = packet.get_type() {
+                                    socket.insert_into_buffer(packet);
+
+                                    // notify socket that data is available
+                                    if sender.send(false).is_err() {
+                                        // receiver end of channel has been dropped
+                                        return Poll::Ready(Ok(()));
                                     }
-                                    _ => {}
                                 }
 
                                 ready_try_unpin!(
                                     socket.send_packet(&mut reply),
                                     cx
                                 );
+
                                 let dst = socket.connected_to;
 
                                 if let Poll::Pending = poll_unpin!(
@@ -1580,10 +1661,7 @@ impl Future for UtpStreamDriver {
 
                     if let Poll::Ready(_) = self.timer.poll_tick(cx) {
                         debug!("receive timeout detected");
-                        self.timer =
-                            interval(Duration::from_millis(next_timeout));
-                        let mut socket = ready_unpin!(self.socket.lock(), cx);
-                        ready_try_unpin!(socket.handle_receive_timeout(), cx);
+                        ready_try_unpin!(self.handle_timeout(next_timeout), cx);
                     }
 
                     return Poll::Pending;
@@ -1678,7 +1756,7 @@ impl UtpListener {
 #[cfg(test)]
 mod test {
     use std::io::ErrorKind;
-    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+    use std::net::{SocketAddr, ToSocketAddrs};
 
     use super::*;
     use crate::socket::{SocketState, UtpListener, UtpSocket, BUF_SIZE};
@@ -1706,19 +1784,11 @@ mod test {
     }
 
     fn next_test_ip4() -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(
-            "127.0.0.1".parse().unwrap(),
-            next_test_port(),
-        ))
+        ("127.0.0.1".parse::<Ipv4Addr>().unwrap(), next_test_port()).into()
     }
 
     fn next_test_ip6() -> SocketAddr {
-        SocketAddr::V6(SocketAddrV6::new(
-            "::1".parse().unwrap(),
-            next_test_port(),
-            0,
-            0,
-        ))
+        ("::1".parse::<Ipv6Addr>().unwrap(), next_test_port()).into()
     }
 
     async fn stream_accept(server_addr: SocketAddr) -> UtpStream {
@@ -1745,11 +1815,50 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_stream_fast_resend() {
+        pretty_env_logger::init();
+        let server_addr = next_test_ip4();
+        const DATA: u8 = 2;
+        const LEN: usize = 345;
+
+        let socket =
+            UtpSocketRef::bind(server_addr).await.expect("bind failed");
+
+        let handle = task::spawn(async move {
+            let buf = [DATA; LEN];
+            let (mut stream, driver) =
+                socket.accept().await.expect("accept failed");
+
+            task::spawn(driver);
+
+            stream.write_all(&buf).await.expect("write failed");
+            stream.flush().await.expect("flush failed");
+        });
+
+        let mut socket = UtpSocket::connect(server_addr)
+            .await
+            .expect("connect failed");
+
+        let mut buf = [0u8; LEN];
+
+        // intentionaly drop the received packet to trigger fast_resend
+        socket
+            .socket
+            .recv_from(&mut buf)
+            .await
+            .expect("read failed");
+
+        socket.recv_from(&mut buf).await.expect("failed to resend");
+
+        handle.await.expect("task failure");
+    }
+
+    #[tokio::test]
     async fn test_stream_connection() {
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut stream = stream_accept(server_addr).await;
             let mut buf = [0u8; 256];
 
@@ -1765,8 +1874,11 @@ mod test {
 
         let mut stream = stream_connect(client_addr, server_addr).await;
         let buf = [1u8; 256];
+
         stream.write_all(&buf).await.expect("failed to write");
         stream.shutdown().await.expect("failed to close connection");
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -1776,7 +1888,7 @@ mod test {
         const LEN: usize = 2000;
         const DATA: u8 = 1;
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut stream = stream_accept(server_addr).await;
             let mut buf = [0u8; LEN];
 
@@ -1792,6 +1904,105 @@ mod test {
 
         stream.write_all(&buf).await.expect("failed to write");
         stream.shutdown().await.expect("failed to close");
+
+        handle.await.expect("task failure");
+    }
+
+    #[tokio::test]
+    async fn test_stream_closed_send() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        const LEN: usize = 1240;
+        const DATA: u8 = 12;
+
+        let handle = task::spawn(async move {
+            let mut stream = stream_accept(server_addr).await;
+            let mut buf = [0u8; LEN];
+
+            stream.read_exact(&mut buf).await.expect("read failed");
+            stream.shutdown().await.expect("close failed");
+            stream
+                .read(&mut buf)
+                .await
+                .expect_err("read on closed stream");
+        });
+
+        let mut stream = stream_connect(client_addr, server_addr).await;
+        let buf = [DATA; LEN];
+
+        stream.write_all(&buf).await.expect("write failed");
+        stream.shutdown().await.expect("shutdown failed");
+
+        stream
+            .write_all(&buf)
+            .await
+            .expect_err("wrote on closed stream");
+        handle.await.expect("execution failure");
+    }
+
+    #[tokio::test]
+    async fn test_stream_connect_closed() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        let socket =
+            UtpSocketRef::bind(client_addr).await.expect("bind failed");
+
+        assert!(
+            socket.connect(server_addr).await.is_err(),
+            "connected to void"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_read_timeout() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        let handle = task::spawn(async move {
+            let sock =
+                UtpSocketRef::bind(server_addr).await.expect("bind failed");
+
+            // ignore driver so that this stream doesn't answer to packets
+            let _ = sock.accept().await.expect("accept failed");
+        });
+
+        let mut socket = stream_connect(client_addr, server_addr).await;
+        let mut buf = [0u8; 1024];
+
+        socket
+            .read_exact(&mut buf)
+            .await
+            .expect_err("read from non responding peer");
+
+        handle.await.expect("task panic");
+    }
+
+    #[tokio::test]
+    async fn test_stream_write_timeout() {
+        let (server, client) = (next_test_ip4(), next_test_ip4());
+        const DATA: u8 = 45;
+        const LEN: usize = 123;
+
+        let handle = task::spawn(async move {
+            let mut stream = stream_accept(server).await;
+            let buf = [DATA; LEN];
+
+            stream
+                .write_all(&buf)
+                .await
+                .expect("packets weren't buffered");
+            stream
+                .flush()
+                .await
+                .expect_err("flush suceeded without ack");
+        });
+
+        let sock = UtpSocketRef::bind(client).await.expect("bind failed");
+        let _ = sock.connect(server).await.expect("connect failed");
+
+        handle.await.expect("execution failure");
     }
 
     #[tokio::test]
@@ -1802,12 +2013,14 @@ mod test {
         const LEN: usize = 1240;
         const DATA: u8 = 25;
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut stream = stream_accept(server_addr).await;
-            let mut buf = [0u8; LEN];
+            let mut buf = [0u8; 2 * LEN];
 
-            for _ in 0..2 {
-                stream.read_exact(&mut buf).await.expect("failed to read");
+            stream.read_exact(&mut buf).await.expect("failed to read");
+
+            for b in buf.iter() {
+                assert_eq!(*b, DATA, "data corrupted");
             }
 
             stream.shutdown().await.expect("failed to shutdown");
@@ -1820,13 +2033,15 @@ mod test {
         stream.flush().await.expect("failed to flush");
         stream.write_all(&buf).await.expect("failed to write");
         stream.shutdown().await.expect("failed to shutdown");
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
     async fn test_socket_ipv4() {
         let server_addr = next_test_ip4();
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut server = iotry!(UtpSocket::bind(server_addr));
             assert_eq!(server.state, SocketState::New);
 
@@ -1858,6 +2073,8 @@ mod test {
             server_addr.to_socket_addrs().unwrap().next().unwrap()
         );
         iotry!(client.close());
+
+        handle.await.expect("task failure");
     }
 
     #[ignore]
@@ -1907,7 +2124,7 @@ mod test {
         let mut server = iotry!(UtpSocket::bind(server_addr));
         assert_eq!(server.state, SocketState::New);
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             assert_eq!(client.state, SocketState::Connected);
             assert!(client.close().await.is_ok());
@@ -1926,6 +2143,8 @@ mod test {
             e => panic!("Expected Ok(0), got {:?}", e),
         }
         assert_eq!(server.state, SocketState::Closed);
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -1935,7 +2154,7 @@ mod test {
         let mut server = iotry!(UtpSocket::bind(server_addr));
         assert_eq!(server.state, SocketState::New);
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             assert_eq!(client.state, SocketState::Connected);
             iotry!(client.close());
@@ -1951,6 +2170,8 @@ mod test {
             Err(ref e) if e.kind() == ErrorKind::NotConnected => (),
             v => panic!("expected {:?}, got {:?}", ErrorKind::NotConnected, v),
         }
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -1961,7 +2182,7 @@ mod test {
 
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             // Make the server listen for incoming connections
             let mut buf = [0u8; BUF_SIZE];
             let _resp = server.recv(&mut buf).await.unwrap();
@@ -1983,6 +2204,8 @@ mod test {
         // and, hence, the receiver's acknowledgement number.
         assert_eq!(client.ack_nr, ack_nr);
         drop(client);
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2248,7 +2471,7 @@ mod test {
         let d = data.clone();
         assert_eq!(LEN, data.len());
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             iotry!(client.send_to(&d[..]));
             iotry!(client.close());
@@ -2302,6 +2525,8 @@ mod test {
 
         // Receive close
         iotry!(server.recv_from(&mut buf));
+
+        handle.await.expect("task failure");
     }
 
     #[ignore]
@@ -2328,7 +2553,7 @@ mod test {
             client.receiver_connection_id + 1
         );
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             assert_eq!(client.state, SocketState::Connected);
             assert_eq!(client.connected_to, server_addr);
@@ -2365,6 +2590,8 @@ mod test {
         }
 
         drop(server);
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2423,7 +2650,7 @@ mod test {
             client.receiver_connection_id + 1
         );
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             assert_eq!(client.state, SocketState::Connected);
 
@@ -2470,6 +2697,8 @@ mod test {
         }
         assert_eq!(received.len(), expected.len());
         assert_eq!(received, expected);
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2481,7 +2710,7 @@ mod test {
         let data = (0..LEN).map(|idx| idx as u8).collect::<Vec<u8>>();
         let to_send = data.clone();
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
 
             // Send everything except the odd chunks
@@ -2517,6 +2746,7 @@ mod test {
         }
         assert_eq!(received.len(), data.len());
         assert_eq!(received, data);
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2527,7 +2757,7 @@ mod test {
         let data = (0..LEN).map(|idx| idx as u8).collect::<Vec<u8>>();
         let to_send = data.clone();
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             iotry!(client.send_to(&to_send[..]));
             iotry!(client.close());
@@ -2545,6 +2775,7 @@ mod test {
 
         assert_eq!(read.len(), data.len());
         assert_eq!(read, data);
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2563,7 +2794,7 @@ mod test {
         client.seq_nr =
             ::std::u16::MAX - (to_send.len() / (BUF_SIZE * 2)) as u16;
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             // Send enough data to rollover
             iotry!(client.send_to(&to_send[..]));
@@ -2584,6 +2815,7 @@ mod test {
         }
         assert_eq!(received.len(), data.len());
         assert_eq!(received, data);
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2601,7 +2833,7 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UdpSocket::bind(server_addr));
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             match UtpSocket::connect(server_addr).await {
                 Err(ref e) if e.kind() == ErrorKind::Other => (), // OK
                 Err(e) => panic!("Expected ErrorKind::Other, got {:?}", e),
@@ -2616,6 +2848,8 @@ mod test {
             }
             _ => panic!(),
         }
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2628,7 +2862,7 @@ mod test {
         let mut packet = Packet::new();
         packet.set_type(PacketType::Data);
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             match server.recv_from(&mut buf).await {
                 Ok((_len, client_addr)) => {
                     iotry!(server.send_to(packet.as_ref(), client_addr));
@@ -2644,6 +2878,8 @@ mod test {
             }
             Ok(_) => panic!("Expected Err, got Ok"),
         }
+
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2652,7 +2888,7 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut buf = [0; BUF_SIZE];
             loop {
                 match server.recv_from(&mut buf).await {
@@ -2680,6 +2916,7 @@ mod test {
             Err(e) => panic!("{:?}", e),
         }
         iotry!(client.close());
+        handle.await.expect("task failure");
     }
 
     #[tokio::test]
@@ -2688,7 +2925,7 @@ mod test {
         let server_addr = next_test_ip4();
         let mut server = iotry!(UtpSocket::bind(server_addr));
 
-        task::spawn(async move {
+        let handle = task::spawn(async move {
             let mut client = iotry!(UtpSocket::connect(server_addr));
             let mut packet = Packet::new();
             packet.set_wnd_size(BUF_SIZE as u32);
@@ -2711,7 +2948,10 @@ mod test {
             match server.recv_from(&mut buf).await {
                 Ok((0, _src)) => break,
                 Ok(_) => (),
-                Err(ref e) if e.kind() == ErrorKind::ConnectionReset => return,
+                Err(ref e) if e.kind() == ErrorKind::ConnectionReset => {
+                    handle.await.expect("task failure");
+                    return;
+                }
                 Err(e) => panic!("{:?}", e),
             }
         }
