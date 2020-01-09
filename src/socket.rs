@@ -241,7 +241,7 @@ impl UtpSocket {
             packet.set_timestamp(now_microseconds());
 
             // Send packet
-            debug!("Connecting to {}", socket.connected_to);
+            debug!("connecting to {}", socket.connected_to);
             socket
                 .socket
                 .send_to(packet.as_ref(), socket.connected_to)
@@ -260,7 +260,7 @@ impl UtpSocket {
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    debug!("Timed out, retrying");
+                    debug!("timed out, retrying");
                     syn_timeout *= 2;
                     continue;
                 }
@@ -630,22 +630,25 @@ impl UtpSocket {
         Ok(())
     }
 
+    fn max_inflight(&self) -> u32 {
+        let max_inflight = min(self.cwnd, self.remote_wnd_size);
+        max(MIN_CWND * MSS, max_inflight)
+    }
+
     /// Send one packet.
     #[inline]
     async fn send_packet(&mut self, packet: &mut Packet) -> Result<()> {
         debug!("current window: {}", self.send_window.len());
-        let max_inflight = min(self.cwnd, self.remote_wnd_size);
-        let max_inflight = max(MIN_CWND * MSS, max_inflight);
         let now = now_microseconds();
 
         // Wait until enough in-flight packets are acknowledged for rate control
         // purposes, but don't wait more than 500 ms (PRE_SEND_TIMEOUT) before
         // sending the packet.
-        while self.curr_window >= max_inflight
+        while self.curr_window >= self.max_inflight()
             && now_microseconds() - now < PRE_SEND_TIMEOUT.into()
         {
             debug!("self.curr_window: {}", self.curr_window);
-            debug!("max_inflight: {}", max_inflight);
+            debug!("max_inflight: {}", self.max_inflight());
             debug!("self.duplicate_ack_count: {}", self.duplicate_ack_count);
             debug!("now_microseconds() - now = {}", now_microseconds() - now);
             let mut buf = [0; BUF_SIZE];
@@ -781,7 +784,7 @@ impl UtpSocket {
     /// A fast resend request consists of sending three State packets
     /// (acknowledging the last received packet) in quick succession.
     fn send_fast_resend_request(&mut self) {
-        for _ in 0..3 {
+        for _ in 0..3usize {
             let mut packet = Packet::new();
             packet.set_type(PacketType::State);
             let self_t_micro = now_microseconds();
@@ -790,7 +793,6 @@ impl UtpSocket {
             packet.set_connection_id(self.sender_connection_id);
             packet.set_seq_nr(self.seq_nr);
             packet.set_ack_nr(self.ack_nr);
-
             self.unsent_queue.push_back(packet);
         }
     }
@@ -1312,14 +1314,29 @@ impl UtpSocketRef {
     /// in order for the associated `UtpStream` to work properly.
     /// Accepting a new connection will consume this listener.
     pub async fn accept(self) -> Result<(UtpStream, UtpStreamDriver)> {
-        let (src, dst) = {
+        let (src, dst);
+
+        loop {
             let mut socket = self.0.lock().await;
             let mut buf = [0u8; BUF_SIZE];
 
-            socket.recv_from(&mut buf).await?;
+            let (read, remote) = socket.socket.recv_from(&mut buf).await?;
 
-            (socket.socket.local_addr()?, socket.connected_to)
-        };
+            let packet = Packet::try_from(&buf[..read])?;
+
+            debug!("accept receive {:?}", packet);
+
+            if let Ok(Some(reply)) = socket.handle_packet(&packet, remote) {
+                src = socket.socket.local_addr()?;
+                dst = socket.connected_to;
+
+                socket.socket.send_to(reply.as_ref(), dst).await?;
+
+                debug!("sent {:?} to {}", reply, dst);
+                debug!("accepted connection {} -> {}", dst, src);
+                break;
+            }
+        }
 
         let (tx, rx) = unbounded_channel();
         let socket = self.0;
@@ -1339,7 +1356,7 @@ impl UtpSocketRef {
 /// fashion with the `AsyncRead` and `AsyncWrite` traits.
 pub struct UtpStream {
     socket: Arc<Mutex<UtpSocket>>,
-    receiver: UnboundedReceiver<bool>,
+    receiver: UnboundedReceiver<Result<()>>,
     local: SocketAddr,
     remote: SocketAddr,
 }
@@ -1347,7 +1364,7 @@ pub struct UtpStream {
 impl UtpStream {
     fn new(
         socket: Arc<Mutex<UtpSocket>>,
-        receiver: UnboundedReceiver<bool>,
+        receiver: UnboundedReceiver<Result<()>>,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Self {
@@ -1409,7 +1426,7 @@ where
             debug!("waiting on connection driver to fetch new data");
             match poll_unpin!(self.receiver.recv(), cx) {
                 // either driver sender was dropped or disconnection notice
-                Poll::Ready(None) | Poll::Ready(Some(true)) => {
+                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
                     debug!("connection driver has died");
                     Poll::Ready(Ok(0))
                 }
@@ -1566,23 +1583,31 @@ where
 /// driver is spawned as a tokio task.
 pub struct UtpStreamDriver {
     socket: Arc<Mutex<UtpSocket>>,
-    sender: UnboundedSender<bool>,
+    sender: UnboundedSender<Result<()>>,
     timer: Interval,
+    timeout_nr: u8,
 }
 
 impl UtpStreamDriver {
     fn new(
         socket: Arc<Mutex<UtpSocket>>,
-        sender: UnboundedSender<bool>,
+        sender: UnboundedSender<Result<()>>,
     ) -> Self {
         Self {
             socket,
             sender,
             timer: interval(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
+            timeout_nr: 0,
         }
     }
 
     async fn handle_timeout(&mut self, next_timeout: u64) -> Result<()> {
+        if self.timeout_nr > 3 {
+            return Err(SocketError::ConnectionTimedOut.into());
+        }
+
+        self.timeout_nr += 1;
+
         let ret = {
             let mut socket = self.socket.lock().await;
             socket.handle_receive_timeout().await
@@ -1601,7 +1626,6 @@ impl Future for UtpStreamDriver {
         let sender = self.sender.clone();
         let mut socket = ready_unpin!(self.socket.lock(), cx);
         let mut buf = [0u8; BUF_SIZE + HEADER_SIZE];
-        let _timeout = Duration::from_millis(socket.congestion_timeout);
 
         loop {
             debug!("stream driver poll attempt");
@@ -1609,7 +1633,7 @@ impl Future for UtpStreamDriver {
                 debug!("socket is closing");
                 mem::drop(socket); // socket is closed
 
-                if self.sender.send(true).is_err() {
+                if self.sender.send(Ok(())).is_err() {
                     error!("failed to notify socket of termination");
                 }
 
@@ -1627,7 +1651,7 @@ impl Future for UtpStreamDriver {
                                     socket.insert_into_buffer(packet);
 
                                     // notify socket that data is available
-                                    if sender.send(false).is_err() {
+                                    if sender.send(Ok(())).is_err() {
                                         // receiver end of channel has been dropped
                                         return Poll::Ready(Ok(()));
                                     }
@@ -1662,6 +1686,9 @@ impl Future for UtpStreamDriver {
                     if let Poll::Ready(_) = self.timer.poll_tick(cx) {
                         debug!("receive timeout detected");
                         ready_try_unpin!(self.handle_timeout(next_timeout), cx);
+
+                        // make context wake this task up on timeout
+                        let _ = self.timer.poll_tick(cx);
                     }
 
                     return Poll::Pending;
@@ -1740,10 +1767,7 @@ impl UtpListener {
 
             Ok((socket, src))
         } else {
-            Err(
-                SocketError::Other("Reached unreachable statement".to_owned())
-                    .into(),
-            )
+            Err(SocketError::Other("invalid reply from peer".to_owned()).into())
         }
     }
 
@@ -1816,7 +1840,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_fast_resend() {
-        pretty_env_logger::init();
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         const DATA: u8 = 2;
         const LEN: usize = 345;
@@ -1832,7 +1856,7 @@ mod test {
             task::spawn(driver);
 
             stream.write_all(&buf).await.expect("write failed");
-            stream.flush().await.expect("flush failed");
+            stream.shutdown().await.expect("shutdown failed");
         });
 
         let mut socket = UtpSocket::connect(server_addr)
@@ -1849,12 +1873,14 @@ mod test {
             .expect("read failed");
 
         socket.recv_from(&mut buf).await.expect("failed to resend");
+        socket.close().await.expect("close failed");
 
         handle.await.expect("task failure");
     }
 
     #[tokio::test]
     async fn test_stream_connection() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -1883,6 +1909,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_packet_split() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
         const LEN: usize = 2000;
@@ -1910,6 +1937,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_closed_send() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -1943,6 +1971,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_connect_closed() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -1957,6 +1986,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_read_timeout() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -1981,6 +2011,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_write_timeout() {
+        let _ = pretty_env_logger::try_init();
         let (server, client) = (next_test_ip4(), next_test_ip4());
         const DATA: u8 = 45;
         const LEN: usize = 123;
