@@ -23,7 +23,9 @@ use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::Mutex;
-use tokio::time::{interval, timeout, Interval};
+use tokio::time::{
+    delay_for, timeout, Delay as TokioDelay, Instant as TokioInstant,
+};
 
 // For simplicity's sake, let us assume no packet will ever exceed the
 // Ethernet maximum transfer unit of 1500 bytes.
@@ -942,6 +944,7 @@ impl UtpSocket {
             }
             (SocketState::FinSent, PacketType::State) => {
                 if packet.ack_nr() == self.seq_nr {
+                    debug!("connection closed succesfully");
                     self.state = SocketState::Closed;
                 } else {
                     self.handle_state_packet(packet);
@@ -1265,8 +1268,7 @@ impl UtpSocketRef {
         for _ in 0..MAX_SYN_RETRIES {
             packet.set_timestamp(now_microseconds());
 
-            // Send packet
-            debug!("Connecting to {}", socket.connected_to);
+            debug!("connecting to {}", socket.connected_to);
             socket
                 .socket
                 .send_to(packet.as_ref(), socket.connected_to)
@@ -1274,7 +1276,6 @@ impl UtpSocketRef {
             socket.state = SocketState::SynSent;
             debug!("sent {:?}", packet);
 
-            // Validate response
             let to = Duration::from_millis(syn_timeout);
 
             match timeout(to, socket.socket.recv_from(&mut buf)).await {
@@ -1285,7 +1286,7 @@ impl UtpSocketRef {
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    debug!("Timed out, retrying");
+                    debug!("timed out, retrying");
                     syn_timeout *= 2;
                     continue;
                 }
@@ -1416,7 +1417,7 @@ where
             debug!("flushed {} bytes of received data", read);
             Poll::Ready(Ok(read))
         } else if state == SocketState::Closed {
-            debug!("read on closed connectio");
+            debug!("read on closed connection");
             Poll::Ready(Ok(0))
         } else if state == SocketState::ResetReceived {
             debug!("read on reset connection");
@@ -1424,6 +1425,7 @@ where
         } else {
             // make this wake up when data is received by the driver
             debug!("waiting on connection driver to fetch new data");
+
             match poll_unpin!(self.receiver.recv(), cx) {
                 // either driver sender was dropped or disconnection notice
                 Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
@@ -1457,6 +1459,16 @@ where
         debug!("trying to send {} bytes", buf.len());
 
         for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
+            if socket.curr_window >= socket.max_inflight() {
+                if sent > 0 {
+                    return Poll::Ready(Ok(sent));
+                } else {
+                    // FIXME: wake up this task somehow
+                    debug!("window is full");
+                    return Poll::Pending;
+                }
+            }
+
             debug!("attempting to send chunk of {} byte", chunk.len());
             let mut packet = Packet::with_payload(chunk);
 
@@ -1485,7 +1497,7 @@ where
                         cx
                     ) {
                         Poll::Pending => 0,
-                        Poll::Ready(Err(_e)) => todo!("error handling"),
+                        Poll::Ready(Err(e)) => todo!("error: {}", e),
                         Poll::Ready(Ok(written)) if written == 0 => continue,
                         Poll::Ready(Ok(written)) => {
                             debug!("sent packet of {} bytes", written);
@@ -1505,10 +1517,19 @@ where
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-        let mut socket = ready_unpin!(self.lock(), cx);
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        debug!("attempting flush");
 
-        debug!("flush attempt");
+        if let Poll::Ready(Some(Err(e))) = poll_unpin!(self.receiver.recv(), cx)
+        {
+            debug!("driver signaled error over channel");
+            return Poll::Ready(Err(e));
+        }
+
+        let mut socket = ready_unpin!(self.lock(), cx);
 
         while let Some(mut packet) = socket.unsent_queue.pop_front() {
             if let Poll::Pending =
@@ -1566,13 +1587,17 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<()>> {
-        if let Poll::Pending = self.as_mut().poll_flush(cx) {
-            Poll::Pending
-        } else {
-            let mut socket = ready_unpin!(self.lock(), cx);
-            let result = ready_unpin!(socket.close(), cx);
+        debug!("closing connection");
 
-            Poll::Ready(result)
+        match self.as_mut().poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let mut socket = ready_unpin!(self.lock(), cx);
+                let result = ready_unpin!(socket.close(), cx);
+
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
     }
 }
@@ -1584,8 +1609,8 @@ where
 pub struct UtpStreamDriver {
     socket: Arc<Mutex<UtpSocket>>,
     sender: UnboundedSender<Result<()>>,
-    timer: Interval,
-    timeout_nr: u8,
+    timer: TokioDelay,
+    timeout_nr: u32,
 }
 
 impl UtpStreamDriver {
@@ -1596,24 +1621,31 @@ impl UtpStreamDriver {
         Self {
             socket,
             sender,
-            timer: interval(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
+            timer: delay_for(Duration::from_millis(INITIAL_CONGESTION_TIMEOUT)),
             timeout_nr: 0,
         }
     }
 
     async fn handle_timeout(&mut self, next_timeout: u64) -> Result<()> {
-        if self.timeout_nr > 3 {
+        self.timeout_nr += 1;
+        debug!(
+            "timed out {} times out of {} max, retrying in {} ms",
+            self.timeout_nr, MAX_RETRANSMISSION_RETRIES, next_timeout
+        );
+
+        if self.timeout_nr > MAX_RETRANSMISSION_RETRIES {
+            let mut socket = self.socket.lock().await;
+            socket.state = SocketState::Closed;
+
             return Err(SocketError::ConnectionTimedOut.into());
         }
-
-        self.timeout_nr += 1;
 
         let ret = {
             let mut socket = self.socket.lock().await;
             socket.handle_receive_timeout().await
         };
 
-        self.timer = interval(Duration::from_millis(next_timeout));
+        self.timer = delay_for(Duration::from_millis(next_timeout));
 
         ret
     }
@@ -1652,7 +1684,9 @@ impl Future for UtpStreamDriver {
 
                                     // notify socket that data is available
                                     if sender.send(Ok(())).is_err() {
-                                        // receiver end of channel has been dropped
+                                        debug!(
+                                            "dropped socket, killing driver"
+                                        );
                                         return Poll::Ready(Ok(()));
                                     }
                                 }
@@ -1683,12 +1717,31 @@ impl Future for UtpStreamDriver {
 
                     mem::drop(socket);
 
-                    if let Poll::Ready(_) = self.timer.poll_tick(cx) {
+                    if self.timer.is_elapsed() {
                         debug!("receive timeout detected");
-                        ready_try_unpin!(self.handle_timeout(next_timeout), cx);
 
-                        // make context wake this task up on timeout
-                        let _ = self.timer.poll_tick(cx);
+                        match poll_unpin!(self.handle_timeout(next_timeout), cx)
+                        {
+                            Poll::Pending => todo!("socket buffer full"),
+                            Poll::Ready(Ok(())) => {
+                                let now: TokioInstant = Instant::now().into();
+
+                                self.timer.reset(
+                                    now + Duration::from_millis(next_timeout),
+                                );
+                                ready_unpin!(self.timer, cx);
+                            }
+                            Poll::Ready(Err(e)) => {
+                                debug!("remote peer timed out too many times");
+                                self.sender
+                                    .send(Err(e.kind().into()))
+                                    .expect("failed to propagate");
+
+                                return Poll::Ready(Err(e));
+                            }
+                        }
+                    } else {
+                        ready_unpin!(self.timer, cx);
                     }
 
                     return Poll::Pending;
@@ -1727,11 +1780,13 @@ impl UtpListener {
 
     /// Accepts a new incoming connection from this listener.
     ///
-    /// This function will block the caller until a new uTP connection is established. When
-    /// established, the corresponding `UtpSocket` and the peer's remote address will be returned.
+    /// This function will block the caller until a new uTP connection is
+    /// established. When established, the corresponding `UtpSocket` and the
+    /// peer's remote address will be returned.
     ///
-    /// Notice that the resulting `UtpSocket` is bound to a different local port than the public
-    /// listening port (which `UtpListener` holds). This may confuse the remote peer!
+    /// Notice that the resulting `UtpSocket` is bound to a different local port
+    /// than the public listening port (which `UtpListener` holds). This may
+    /// confuse the remote peer!
     pub async fn accept(&mut self) -> Result<(UtpSocket, SocketAddr)> {
         let mut buf = [0; BUF_SIZE];
 
@@ -1970,6 +2025,32 @@ mod test {
     }
 
     #[tokio::test]
+    async fn stream_clean_close() {
+        let server_addr = next_test_ip4();
+        let client_addr = next_test_ip4();
+
+        const DATA: u8 = 1;
+        const LEN: usize = 1024;
+
+        let handle = task::spawn(async move {
+            let mut stream = stream_accept(server_addr).await;
+            let buf = [DATA; LEN];
+
+            stream.write_all(&buf).await.expect("write failed");
+            stream.shutdown().await.expect("shutdown failed");
+        });
+
+        let mut socket = stream_connect(client_addr, server_addr).await;
+        let mut buf = [0u8; 1024];
+
+        socket.read_exact(&mut buf).await.expect("read failed");
+
+        socket.shutdown().await.expect("shutdown failed");
+
+        handle.await.expect("task panic");
+    }
+
+    #[tokio::test]
     async fn test_stream_connect_closed() {
         let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
@@ -2001,6 +2082,8 @@ mod test {
         let mut socket = stream_connect(client_addr, server_addr).await;
         let mut buf = [0u8; 1024];
 
+        socket.socket.lock().await.congestion_timeout = 100;
+
         socket
             .read_exact(&mut buf)
             .await
@@ -2020,6 +2103,8 @@ mod test {
             let mut stream = stream_accept(server).await;
             let buf = [DATA; LEN];
 
+            stream.socket.lock().await.congestion_timeout = 100;
+
             stream
                 .write_all(&buf)
                 .await
@@ -2038,6 +2123,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_flush_then_send() {
+        let _ = pretty_env_logger::try_init();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
