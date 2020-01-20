@@ -12,14 +12,17 @@ version = "0.8.0"
 edition = "2018"
 
 [dependencies]
-tokio = { version = "0.2.4", features = [ "udp", "time", "macros", "rt-core", "io-util", "sync" ] }
-log = "0.3"
+tokio = { version = "0.2.9", features = [ "udp", "time", "macros", "rt-core", "io-util", "sync" ] }
+log = "0.4.7"
 num-traits = "0.1"
 rand = "0.3"
+tracing = "0.1.12"
+tracing-futures = "0.2.1"
 
 [dev-dependencies]
 quickcheck = "0.4"
-pretty_env_logger = "0.3.1"
+tracing-subscriber = { version = "0.2.0-alpha.4", features = [ "fmt" ] }
+
 [lib]
 name = "utp"
 
