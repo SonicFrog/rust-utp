@@ -517,8 +517,8 @@ mod tests {
         assert_eq!(packet.get_extension_type(), ExtensionType::None);
         assert_eq!(packet.get_type(), State);
         assert_eq!(packet.connection_id(), 16808);
-        assert_eq!(packet.timestamp(), Timestamp(2570047530));
-        assert_eq!(packet.timestamp_difference(), Delay(2672436769));
+        assert_eq!(packet.timestamp(), Timestamp(2_570_047_530));
+        assert_eq!(packet.timestamp_difference(), Delay(2_672_436_769));
         assert_eq!(packet.wnd_size(), 2u32.pow(20));
         assert_eq!(packet.seq_nr(), 15090);
         assert_eq!(packet.ack_nr(), 27769);
