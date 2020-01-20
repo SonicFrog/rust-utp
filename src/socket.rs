@@ -1,7 +1,7 @@
 use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io::Result;
+use std::io::{ErrorKind, Result};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
@@ -27,6 +27,8 @@ use tokio::time::{
     delay_for, timeout, Delay as TokioDelay, Instant as TokioInstant,
 };
 
+use tracing::debug;
+
 // For simplicity's sake, let us assume no packet will ever exceed the
 // Ethernet maximum transfer unit of 1500 bytes.
 const BUF_SIZE: usize = 1500;
@@ -43,10 +45,6 @@ const BASE_HISTORY: usize = 10; // base delays history size
 const MAX_SYN_RETRIES: u32 = 5; // maximum connection retries
 const MAX_RETRANSMISSION_RETRIES: u32 = 5; // maximum retransmission retries
 const WINDOW_SIZE: u32 = 1024 * 1024; // local receive window size
-
-/// Maximum time (in microseconds) to wait for incoming packets when the send
-/// window is full
-const PRE_SEND_TIMEOUT: u32 = 500_000;
 
 /// Maximum age of base delay sample (60 seconds)
 const MAX_BASE_DELAY_AGE: Delay = Delay(60_000_000);
@@ -292,8 +290,14 @@ impl UtpSocket {
             return Ok(());
         }
 
+        let local = self.socket.local_addr()?;
+
+        debug!("closing {} -> {}", local, self.connected_to);
+
         // Flush unsent and unacknowledged packets
         self.flush().await?;
+
+        debug!("close flush completed");
 
         let mut packet = Packet::new();
         packet.set_connection_id(self.sender_connection_id);
@@ -314,6 +318,8 @@ impl UtpSocket {
         while self.state != SocketState::Closed {
             self.recv(&mut buf).await?;
         }
+
+        debug!("closed {} -> {}", local, self.connected_to);
 
         Ok(())
     }
@@ -555,9 +561,9 @@ impl UtpSocket {
             return flushed;
         }
 
+        // only flush data that we acked (e.g. the packets are in order in the buffer)
         if !self.incoming_buffer.is_empty()
-            && (self.ack_nr == self.incoming_buffer[0].seq_nr()
-                || self.ack_nr + 1 == self.incoming_buffer[0].seq_nr())
+            && (self.ack_nr.wrapping_sub(self.incoming_buffer[0].seq_nr()) >= 1)
         {
             let flushed =
                 unsafe_copy(&self.incoming_buffer[0].payload()[..], buf);
@@ -570,6 +576,12 @@ impl UtpSocket {
             }
 
             return flushed;
+        } else if !self.incoming_buffer.is_empty() {
+            debug!(
+                "not flushing out of order data, acked={} > cached={}",
+                self.ack_nr,
+                self.incoming_buffer[0].seq_nr()
+            );
         }
 
         0
@@ -641,39 +653,13 @@ impl UtpSocket {
     #[inline]
     async fn send_packet(&mut self, packet: &mut Packet) -> Result<()> {
         debug!("current window: {}", self.send_window.len());
-        let now = now_microseconds();
-
-        // Wait until enough in-flight packets are acknowledged for rate control
-        // purposes, but don't wait more than 500 ms (PRE_SEND_TIMEOUT) before
-        // sending the packet.
-        while self.curr_window >= self.max_inflight()
-            && now_microseconds() - now < PRE_SEND_TIMEOUT.into()
-        {
-            debug!("self.curr_window: {}", self.curr_window);
-            debug!("max_inflight: {}", self.max_inflight());
-            debug!("self.duplicate_ack_count: {}", self.duplicate_ack_count);
-            debug!("now_microseconds() - now = {}", now_microseconds() - now);
-            let mut buf = [0; BUF_SIZE];
-            self.recv(&mut buf).await?;
-        }
-        debug!(
-            "out: now_microseconds() - now = {}",
-            now_microseconds() - now
-        );
-
-        // Check if it still makes sense to send packet, as we might be trying
-        // to resend a lost packet acknowledged in the receive loop above.
-        // If there were no wrapping around of sequence numbers, we'd simply
-        // check if the packet's sequence number is greater than `last_acked`.
-        let distance_a = packet.seq_nr().wrapping_sub(self.last_acked);
-        let distance_b = self.last_acked.wrapping_sub(packet.seq_nr());
-        if distance_a > distance_b {
-            debug!("Packet already acknowledged, skipping...");
-            return Ok(());
-        }
 
         packet.set_timestamp(now_microseconds());
         packet.set_timestamp_difference(self.their_delay);
+
+        self.socket
+            .send_to(packet.as_ref(), self.connected_to)
+            .await?;
 
         debug!("sent {:?}", packet);
 
@@ -841,6 +827,11 @@ impl UtpSocket {
         {
             for _ in 0..=position {
                 let packet = self.send_window.remove(0);
+                debug!("removing {} bytes from send window", packet.len());
+                debug!(
+                    "{} packets left in send window",
+                    self.send_window.len()
+                );
                 self.curr_window -= packet.len() as u32;
             }
         }
@@ -922,10 +913,10 @@ impl UtpSocket {
                 let mut reply = self.prepare_reply(packet, PacketType::State);
                 if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
                     debug!(
-                        "current ack_nr ({}) is behind received packet seq_nr ({})",
-                        self.ack_nr,
-                        packet.seq_nr()
-                    );
+                            "current ack_nr ({}) is behind received packet seq_nr ({})",
+                            self.ack_nr,
+                            packet.seq_nr()
+                        );
 
                     // Set SACK extension payload if the packet is not in order
                     let sack = self.build_selective_ack();
@@ -934,6 +925,8 @@ impl UtpSocket {
                         reply.set_sack(sack);
                     }
                 }
+
+                debug!("received FIN from {}, connection is closed", src);
 
                 // Give up, the remote peer might not care about our missing packets
                 self.state = SocketState::Closed;
@@ -1220,6 +1213,16 @@ macro_rules! poll_unpin {
     }};
 }
 
+macro_rules! ready_try {
+    ($data:expr) => {{
+        match ($data) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(v)) => v,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+        }
+    }};
+}
+
 /// A reference to an existing `UtpSocket` that can be shared amongst multiple
 /// tasks. This can't function unless the corresponding `UtpSocketDriver` is
 /// scheduled to run on the same runtime.
@@ -1386,151 +1389,77 @@ impl UtpStream {
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote
     }
-}
 
-impl Deref for UtpStream {
-    type Target = Mutex<UtpSocket>;
-
-    fn deref(&self) -> &Self::Target {
-        self.socket.deref()
-    }
-}
-
-impl AsyncRead for UtpStream
-where
-    Self: Unpin,
-{
-    fn poll_read(
+    fn handle_driver_notification(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        debug!("read poll for {} bytes", buf.len());
-
-        let (read, state) = {
-            let mut socket = ready_unpin!(self.lock(), cx);
-
-            (socket.flush_incoming_buffer(buf), socket.state)
-        };
-
-        if read > 0 {
-            debug!("flushed {} bytes of received data", read);
-            Poll::Ready(Ok(read))
-        } else if state == SocketState::Closed {
-            debug!("read on closed connection");
-            Poll::Ready(Ok(0))
-        } else if state == SocketState::ResetReceived {
-            debug!("read on reset connection");
-            Poll::Ready(Err(SocketError::ConnectionReset.into()))
-        } else {
-            // make this wake up when data is received by the driver
-            debug!("waiting on connection driver to fetch new data");
-
-            match poll_unpin!(self.receiver.recv(), cx) {
-                // either driver sender was dropped or disconnection notice
-                Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
-                    debug!("connection driver has died");
-                    Poll::Ready(Ok(0))
-                }
-                _ => Poll::Pending,
+        match poll_unpin!(self.receiver.recv(), cx) {
+            // either driver sender was dropped or disconnection notice
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                debug!("connection driver has died");
+                Poll::Ready(Ok(0))
+            }
+            Poll::Ready(Some(Ok(()))) => {
+                debug!("notification from driver");
+                self.poll_read(cx, buf)
+            }
+            Poll::Pending => {
+                debug!("waiting for notification from driver");
+                Poll::Pending
             }
         }
     }
-}
 
-impl AsyncWrite for UtpStream
-where
-    Self: Unpin,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<Result<usize>> {
-        let mut socket = ready_unpin!(self.lock(), cx);
+    fn prepare_packet(socket: &mut UtpSocket, chunk: &[u8]) -> Packet {
+        let mut packet = Packet::with_payload(chunk);
 
-        if socket.state == SocketState::Closed {
-            debug!("writing on closed connection");
-            return Poll::Ready(Ok(0));
-        }
+        packet.set_seq_nr(socket.seq_nr);
+        packet.set_ack_nr(socket.ack_nr);
+        packet.set_connection_id(socket.sender_connection_id);
 
-        let mut sent: usize = 0;
-
-        debug!("trying to send {} bytes", buf.len());
-
-        for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
-            if socket.curr_window >= socket.max_inflight() {
-                if sent > 0 {
-                    return Poll::Ready(Ok(sent));
-                } else {
-                    // FIXME: wake up this task somehow
-                    debug!("window is full");
-                    return Poll::Pending;
-                }
-            }
-
-            debug!("attempting to send chunk of {} byte", chunk.len());
-            let mut packet = Packet::with_payload(chunk);
-
-            packet.set_seq_nr(socket.seq_nr);
-            packet.set_ack_nr(socket.ack_nr);
-            packet.set_connection_id(socket.sender_connection_id);
-
-            match poll_unpin!(socket.send_packet(&mut packet), cx) {
-                Poll::Pending if sent == 0 => {
-                    debug!("socket buffer is full, waiting");
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) if sent == 0 => {
-                    debug!("os error reading data: {}", e);
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending | Poll::Ready(Err(_)) => {
-                    debug!("successfully sent {} bytes, sleeping...", sent);
-                    return Poll::Ready(Ok(sent));
-                }
-
-                Poll::Ready(Ok(())) => {
-                    let dst = socket.connected_to;
-                    let written = match poll_unpin!(
-                        socket.socket.send_to(packet.as_ref(), dst),
-                        cx
-                    ) {
-                        Poll::Pending => 0,
-                        Poll::Ready(Err(e)) => todo!("error: {}", e),
-                        Poll::Ready(Ok(written)) if written == 0 => continue,
-                        Poll::Ready(Ok(written)) => {
-                            debug!("sent packet of {} bytes", written);
-                            written
-                        }
-                    };
-
-                    socket.curr_window += written as u32;
-                    socket.send_window.push(packet);
-
-                    sent += written;
-                    socket.seq_nr = socket.seq_nr.wrapping_add(1);
-                }
-            }
-        }
-
-        Poll::Ready(Ok(buf.len()))
+        packet
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context,
+    fn wait_acks(
+        socket: &mut UtpSocket,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<()>> {
-        debug!("attempting flush");
+        let mut buf = [0u8; BUF_SIZE + HEADER_SIZE];
 
-        if let Poll::Ready(Some(Err(e))) = poll_unpin!(self.receiver.recv(), cx)
+        debug!("waiting for ACKs for {} packets", socket.send_window.len());
+
+        while !socket.send_window.is_empty()
+            && socket.state != SocketState::Closed
         {
-            debug!("driver signaled error over channel");
-            return Poll::Ready(Err(e));
+            let (read, src) = {
+                match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
+                    Poll::Ready(Ok((read, src))) => (read, src),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+
+            let packet = Packet::try_from(&buf[..read])?;
+
+            if let Some(reply) = socket.handle_packet(&packet, src)? {
+                if let Poll::Pending =
+                    poll_unpin!(socket.socket.send_to(reply.as_ref(), src), cx)
+                {
+                    socket.unsent_queue.push_back(reply);
+                    return Poll::Pending;
+                }
+            }
         }
 
-        let mut socket = ready_unpin!(self.lock(), cx);
+        Poll::Ready(Ok(()))
+    }
 
+    fn flush_unsent(
+        socket: &mut UtpSocket,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
         while let Some(mut packet) = socket.unsent_queue.pop_front() {
             if let Poll::Pending =
                 poll_unpin!(socket.send_packet(&mut packet), cx)
@@ -1554,32 +1483,151 @@ where
             }
         }
 
-        debug!("unsent queue cleared");
+        Poll::Ready(Ok(()))
+    }
+}
 
-        let mut buf = [0u8; BUF_SIZE];
+impl Deref for UtpStream {
+    type Target = Mutex<UtpSocket>;
 
-        while !socket.send_window.is_empty() {
-            let (read, src) = {
-                match poll_unpin!(socket.socket.recv_from(&mut buf), cx) {
-                    Poll::Ready(Ok((read, src))) => (read, src),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            };
+    fn deref(&self) -> &Self::Target {
+        self.socket.deref()
+    }
+}
 
-            let packet = Packet::try_from(&buf[..read])?;
+impl AsyncRead for UtpStream
+where
+    Self: Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        debug!("read poll for {} bytes", buf.len());
 
-            if let Some(reply) = socket.handle_packet(&packet, src)? {
-                if let Poll::Pending =
-                    poll_unpin!(socket.socket.send_to(reply.as_ref(), src), cx)
+        let (read, state) = {
+            let mut socket = ready_unpin!(self.lock(), cx);
+
+            (socket.flush_incoming_buffer(buf), socket.state)
+        };
+
+        if read > 0 {
+            debug!("flushed {} bytes of received data", read);
+            Poll::Ready(Ok(read))
+        } else if state == SocketState::Closed {
+            debug!("read on closed connection");
+            Poll::Ready(Ok(0))
+        } else if state == SocketState::ResetReceived {
+            debug!("read on reset connection");
+            Poll::Ready(Err(SocketError::ConnectionReset.into()))
+        } else {
+            self.handle_driver_notification(cx, buf)
+        }
+    }
+}
+
+impl AsyncWrite for UtpStream
+where
+    Self: Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize>> {
+        let mut socket = ready_unpin!(self.lock(), cx);
+
+        if socket.state == SocketState::Closed {
+            debug!("tried to write on closed connection");
+            return Poll::Ready(Err(SocketError::ConnectionClosed.into()));
+        }
+
+        let mut sent: usize = 0;
+
+        debug!("trying to send {} bytes", buf.len());
+
+        for chunk in buf.chunks(MSS as usize - HEADER_SIZE) {
+            if socket.curr_window >= socket.max_inflight() {
+                debug!("send window is full, waiting for ACKs");
+                mem::drop(socket);
+
+                while let Poll::Ready(_) = poll_unpin!(self.receiver.recv(), cx)
                 {
-                    socket.unsent_queue.push_back(reply);
+                }
+
+                return Poll::Pending;
+            }
+
+            debug!("attempting to send chunk of {} byte", chunk.len());
+
+            let mut packet = Self::prepare_packet(&mut socket, chunk);
+
+            match poll_unpin!(socket.send_packet(&mut packet), cx) {
+                Poll::Pending if sent == 0 => {
+                    debug!("socket send buffer is full, waiting..");
                     return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) if sent == 0 => {
+                    debug!("os error reading data: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending | Poll::Ready(Err(_)) => {
+                    debug!("successfully sent {} bytes, sleeping...", sent);
+                    return Poll::Ready(Ok(sent));
+                }
+
+                Poll::Ready(Ok(())) => {
+                    let written = packet.len();
+
+                    socket.curr_window += written as u32;
+                    socket.send_window.push(packet);
+
+                    sent += written;
+                    socket.seq_nr = socket.seq_nr.wrapping_add(1);
+
+                    debug!(
+                        "poll_write sent seq {}, curr_window: {}",
+                        socket.seq_nr - 1,
+                        socket.curr_window
+                    );
                 }
             }
         }
 
-        debug!("succesfully flushed");
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<()>> {
+        debug!("attempting flush");
+
+        match poll_unpin!(self.receiver.recv(), cx) {
+            Poll::Ready(Some(Err(e))) => {
+                debug!("driver signaled error over channel");
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(None) => {
+                debug!("connection driver disconnected");
+                return Poll::Ready(Ok(()));
+            }
+            _ => debug!("no message from driver"),
+        }
+
+        let mut socket = ready_unpin!(self.lock(), cx);
+
+        if socket.state == SocketState::Closed {
+            return Poll::Ready(Err(SocketError::NotConnected.into()));
+        }
+
+        ready_try!(Self::flush_unsent(&mut socket, cx));
+
+        ready_try!(Self::wait_acks(&mut socket, cx));
+
+        debug!("sucessfully flushed");
+
         Poll::Ready(Ok(()))
     }
 
@@ -1587,15 +1635,61 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Result<()>> {
-        debug!("closing connection");
+        debug!("poll_shutdown connection...");
+
+        {
+            let socket = ready_unpin!(self.socket.lock(), cx);
+
+            if socket.state == SocketState::Closed {
+                debug!("socket closed by driver");
+                return Poll::Ready(Ok(()));
+            }
+        }
 
         match self.as_mut().poll_flush(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
-                let mut socket = ready_unpin!(self.lock(), cx);
-                let result = ready_unpin!(socket.close(), cx);
+                {
+                    let mut socket = ready_unpin!(self.socket.lock(), cx);
 
-                Poll::Ready(result)
+                    if socket.state != SocketState::FinSent {
+                        if let Poll::Ready(Ok(())) =
+                            poll_unpin!(socket.close(), cx)
+                        {
+                            return Poll::Ready(Ok(()));
+                        } else {
+                            mem::drop(socket);
+                            ready_unpin!(self.receiver.recv(), cx);
+                        }
+                    }
+                }
+
+                let msg = poll_unpin!(self.receiver.recv(), cx);
+
+                match msg {
+                    Poll::Ready(None) => {
+                        debug!("driver is dead, closing success");
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Some(Ok(()))) => {
+                        debug!("driver sent closing notice");
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Some(Err(e)))
+                        if e.kind() == ErrorKind::NotConnected =>
+                    {
+                        debug!("connection closed by err");
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        debug!("failed to close correctly");
+                        Poll::Ready(Err(e))
+                    }
+                    Poll::Pending => {
+                        debug!("waiting for driver to complete closing");
+                        Poll::Pending
+                    }
+                }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
@@ -1649,6 +1743,69 @@ impl UtpStreamDriver {
 
         ret
     }
+
+    fn notify_close(&mut self) {
+        if self
+            .sender
+            .send(Err(SocketError::NotConnected.into()))
+            .is_err()
+        {
+            error!("failed to notify socket of termination");
+        } else {
+            debug!("notified socket of closing");
+        }
+    }
+
+    fn send_reply(
+        socket: &mut UtpSocket,
+        mut reply: Packet,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        match poll_unpin!(socket.send_packet(&mut reply), cx) {
+            Poll::Pending => {
+                socket.unsent_queue.push_back(reply);
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                error!("driver failed to send packet: {}", e);
+                Poll::Ready(Err(e))
+            }
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn check_timeout(
+        &mut self,
+        cx: &mut Context<'_>,
+        next_timeout: u64,
+    ) -> Poll<Result<()>> {
+        if self.timer.is_elapsed() {
+            debug!("receive timeout detected");
+
+            match poll_unpin!(self.handle_timeout(next_timeout), cx) {
+                Poll::Pending => todo!("socket buffer full"),
+                Poll::Ready(Ok(())) => {
+                    let now: TokioInstant = Instant::now().into();
+
+                    self.timer.reset(now + Duration::from_millis(next_timeout));
+                    ready_unpin!(self.timer, cx);
+
+                    Poll::Pending
+                }
+                Poll::Ready(Err(e)) => {
+                    debug!("remote peer timed out too many times");
+                    self.sender
+                        .send(Err(e.kind().into()))
+                        .expect("failed to propagate");
+
+                    Poll::Ready(Err(e))
+                }
+            }
+        } else {
+            ready_unpin!(self.timer, cx);
+            Poll::Pending
+        }
+    }
 }
 
 impl Future for UtpStreamDriver {
@@ -1661,13 +1818,13 @@ impl Future for UtpStreamDriver {
 
         loop {
             debug!("stream driver poll attempt");
-            if socket.state == SocketState::Closed {
-                debug!("socket is closing");
-                mem::drop(socket); // socket is closed
 
-                if self.sender.send(Ok(())).is_err() {
-                    error!("failed to notify socket of termination");
-                }
+            if socket.state == SocketState::Closed {
+                debug!("socket is closed when attempting poll, killing driver");
+
+                mem::drop(socket);
+
+                self.notify_close();
 
                 return Poll::Ready(Ok(()));
             }
@@ -1678,7 +1835,7 @@ impl Future for UtpStreamDriver {
                         debug!("received packet {:?}", packet);
 
                         match socket.handle_packet(&packet, src) {
-                            Ok(Some(mut reply)) => {
+                            Ok(Some(reply)) => {
                                 if let PacketType::Data = packet.get_type() {
                                     socket.insert_into_buffer(packet);
 
@@ -1691,18 +1848,9 @@ impl Future for UtpStreamDriver {
                                     }
                                 }
 
-                                ready_try_unpin!(
-                                    socket.send_packet(&mut reply),
-                                    cx
-                                );
-
-                                let dst = socket.connected_to;
-
-                                if let Poll::Pending = poll_unpin!(
-                                    socket.socket.send_to(reply.as_ref(), dst),
-                                    cx
-                                ) {
-                                    socket.unsent_queue.push_back(reply);
+                                if let Poll::Pending =
+                                    Self::send_reply(&mut socket, reply, cx)
+                                {
                                     return Poll::Pending;
                                 }
                             }
@@ -1717,34 +1865,7 @@ impl Future for UtpStreamDriver {
 
                     mem::drop(socket);
 
-                    if self.timer.is_elapsed() {
-                        debug!("receive timeout detected");
-
-                        match poll_unpin!(self.handle_timeout(next_timeout), cx)
-                        {
-                            Poll::Pending => todo!("socket buffer full"),
-                            Poll::Ready(Ok(())) => {
-                                let now: TokioInstant = Instant::now().into();
-
-                                self.timer.reset(
-                                    now + Duration::from_millis(next_timeout),
-                                );
-                                ready_unpin!(self.timer, cx);
-                            }
-                            Poll::Ready(Err(e)) => {
-                                debug!("remote peer timed out too many times");
-                                self.sender
-                                    .send(Err(e.kind().into()))
-                                    .expect("failed to propagate");
-
-                                return Poll::Ready(Err(e));
-                            }
-                        }
-                    } else {
-                        ready_unpin!(self.timer, cx);
-                    }
-
-                    return Poll::Pending;
+                    return self.check_timeout(cx, next_timeout);
                 }
             }
         }
@@ -1834,8 +1955,10 @@ impl UtpListener {
 
 #[cfg(test)]
 mod test {
+    use std::env;
     use std::io::ErrorKind;
     use std::net::{SocketAddr, ToSocketAddrs};
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::socket::{SocketState, UtpListener, UtpSocket, BUF_SIZE};
@@ -1845,6 +1968,11 @@ mod test {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task;
+    use tokio::time::interval;
+
+    use tracing::debug_span;
+    use tracing_futures::Instrument;
+    use tracing_subscriber::FmtSubscriber;
 
     macro_rules! iotry {
         ($e:expr) => {
@@ -1855,8 +1983,17 @@ mod test {
         };
     }
 
+    fn init_logger() {
+        if let Some(level) = env::var("RUST_LOG").ok().map(|x| x.parse().ok()) {
+            let subscriber =
+                FmtSubscriber::builder().with_max_level(level).finish();
+
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+    }
+
     fn next_test_port() -> u16 {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
         static NEXT_OFFSET: AtomicUsize = AtomicUsize::new(0);
         const BASE_PORT: u16 = 9600;
         BASE_PORT + NEXT_OFFSET.fetch_add(1, Ordering::Relaxed) as u16
@@ -1878,7 +2015,7 @@ mod test {
             .await
             .expect("failed to accept");
 
-        task::spawn(driver);
+        task::spawn(driver.instrument(debug_span!("stream_driver")));
 
         stream
     }
@@ -1888,14 +2025,14 @@ mod test {
         let (stream, driver) =
             socket.connect(peer).await.expect("failed to connect");
 
-        task::spawn(driver);
+        task::spawn(driver.instrument(debug_span!("stream_driver")));
 
         stream
     }
 
     #[tokio::test]
-    async fn test_stream_fast_resend() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_fast_resend_active() {
+        init_logger();
         let server_addr = next_test_ip4();
         const DATA: u8 = 2;
         const LEN: usize = 345;
@@ -1903,7 +2040,7 @@ mod test {
         let socket =
             UtpSocketRef::bind(server_addr).await.expect("bind failed");
 
-        let handle = task::spawn(async move {
+        let handle = task::spawn(async {
             let buf = [DATA; LEN];
             let (mut stream, driver) =
                 socket.accept().await.expect("accept failed");
@@ -1934,65 +2071,80 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_stream_connection() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_connect_disconnect() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
         let handle = task::spawn(async move {
             let mut stream = stream_accept(server_addr).await;
-            let mut buf = [0u8; 256];
-
-            let read =
-                stream.read_exact(&mut buf).await.expect("failed to read");
-
-            for b in &buf[..read] {
-                assert_eq!(*b, 1, "data was altered");
-            }
 
             stream.shutdown().await.expect("failed to close");
         });
 
         let mut stream = stream_connect(client_addr, server_addr).await;
-        let buf = [1u8; 256];
 
-        stream.write_all(&buf).await.expect("failed to write");
         stream.shutdown().await.expect("failed to close connection");
 
         handle.await.expect("task failure");
     }
 
     #[tokio::test]
-    async fn test_stream_packet_split() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_packet_split() {
+        init_logger();
+
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
         const LEN: usize = 2000;
         const DATA: u8 = 1;
 
         let handle = task::spawn(async move {
-            let mut stream = stream_accept(server_addr).await;
+            let mut stream = stream_accept(server_addr)
+                .instrument(debug_span!("server"))
+                .await;
+
             let mut buf = [0u8; LEN];
 
-            stream.read_exact(&mut buf).await.expect("failed to read");
+            stream
+                .read_exact(&mut buf)
+                .instrument(debug_span!("server_read_exact"))
+                .await
+                .expect("read failed");
 
             for b in &buf[..] {
                 assert_eq!(*b, DATA, "data was altered");
             }
+
+            stream
+                .shutdown()
+                .instrument(debug_span!("server_shutdown"))
+                .await
+                .expect("flush failed");
         });
 
-        let mut stream = stream_connect(client_addr, server_addr).await;
+        let mut stream = stream_connect(client_addr, server_addr)
+            .instrument(debug_span!("client"))
+            .await;
         let buf = [DATA; LEN];
 
-        stream.write_all(&buf).await.expect("failed to write");
-        stream.shutdown().await.expect("failed to close");
+        stream
+            .write_all(&buf)
+            .instrument(debug_span!("client_write_all"))
+            .await
+            .expect("write failed");
 
-        handle.await.expect("task failure");
+        stream
+            .shutdown()
+            .instrument(debug_span!("client_shutdown"))
+            .await
+            .expect("close failed");
+
+        handle.await.expect("task failure")
     }
 
     #[tokio::test]
-    async fn test_stream_closed_send() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_closed_write() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -2000,32 +2152,84 @@ mod test {
         const DATA: u8 = 12;
 
         let handle = task::spawn(async move {
-            let mut stream = stream_accept(server_addr).await;
+            let mut stream = stream_accept(server_addr)
+                .instrument(debug_span!("server"))
+                .await;
             let mut buf = [0u8; LEN];
 
-            stream.read_exact(&mut buf).await.expect("read failed");
-            stream.shutdown().await.expect("close failed");
             stream
-                .read(&mut buf)
+                .read_exact(&mut buf)
+                .instrument(debug_span!("server_read_exact"))
+                .await
+                .expect("read failed");
+
+            stream
+                .shutdown()
+                .instrument(debug_span!("server_shutdown"))
+                .await
+                .expect("shutdown failed");
+
+            stream
+                .read_exact(&mut buf)
+                .instrument(debug_span!("server_closed_read"))
                 .await
                 .expect_err("read on closed stream");
         });
 
-        let mut stream = stream_connect(client_addr, server_addr).await;
+        let mut stream = stream_connect(client_addr, server_addr)
+            .instrument(debug_span!("client"))
+            .await;
         let buf = [DATA; LEN];
-
-        stream.write_all(&buf).await.expect("write failed");
-        stream.shutdown().await.expect("shutdown failed");
 
         stream
             .write_all(&buf)
+            .instrument(debug_span!("client_write_all"))
+            .await
+            .expect("write failed");
+        stream
+            .shutdown()
+            .instrument(debug_span!("client_shutdown"))
+            .await
+            .expect("shutdown failed");
+
+        stream
+            .write_all(&buf)
+            .instrument(debug_span!("client_closed_write"))
             .await
             .expect_err("wrote on closed stream");
+
         handle.await.expect("execution failure");
     }
 
     #[tokio::test]
+    async fn stream_fast_resend_idle() {
+        init_logger();
+        let server = next_test_ip4();
+        let client = next_test_ip4();
+
+        let handle = task::spawn(async move {
+            let mut stream = stream_accept(server).await;
+
+            let mut timer = interval(Duration::from_secs(3));
+
+            timer.tick().await;
+
+            stream.shutdown().await.expect("close failed");
+        });
+
+        let mut stream = stream_connect(client, server).await;
+        let mut timer = interval(Duration::from_secs(4));
+
+        timer.tick().await;
+
+        stream.shutdown().await.expect("close failed");
+
+        handle.await.expect("task failed");
+    }
+
+    #[tokio::test]
     async fn stream_clean_close() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -2033,31 +2237,54 @@ mod test {
         const LEN: usize = 1024;
 
         let handle = task::spawn(async move {
-            let mut stream = stream_accept(server_addr).await;
+            let mut stream = stream_accept(server_addr)
+                .instrument(debug_span!("stream_accept"))
+                .await;
             let buf = [DATA; LEN];
 
-            stream.write_all(&buf).await.expect("write failed");
-            stream.shutdown().await.expect("shutdown failed");
+            stream
+                .write_all(&buf)
+                .instrument(debug_span!("server_write"))
+                .await
+                .expect("write failed");
+
+            stream
+                .shutdown()
+                .instrument(debug_span!("server_shutdown"))
+                .await
+                .expect("shutdown failed");
         });
 
-        let mut socket = stream_connect(client_addr, server_addr).await;
-        let mut buf = [0u8; 1024];
+        let mut socket = stream_connect(client_addr, server_addr)
+            .instrument(debug_span!("stream_connect"))
+            .await;
+        let mut buf = [0u8; LEN];
 
-        socket.read_exact(&mut buf).await.expect("read failed");
+        socket
+            .read_exact(&mut buf)
+            .instrument(debug_span!("client_read"))
+            .await
+            .expect("read failed");
 
-        socket.shutdown().await.expect("shutdown failed");
+        socket
+            .shutdown()
+            .instrument(debug_span!("client_shutdown"))
+            .await
+            .expect("shutdown failed");
 
         handle.await.expect("task panic");
     }
 
     #[tokio::test]
-    async fn test_stream_connect_closed() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_connect_timeout() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
         let socket =
             UtpSocketRef::bind(client_addr).await.expect("bind failed");
+
+        socket.0.lock().await.congestion_timeout = 100;
 
         assert!(
             socket.connect(server_addr).await.is_err(),
@@ -2066,8 +2293,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_stream_read_timeout() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_read_timeout() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -2094,7 +2321,7 @@ mod test {
 
     #[tokio::test]
     async fn test_stream_write_timeout() {
-        let _ = pretty_env_logger::try_init();
+        init_logger();
         let (server, client) = (next_test_ip4(), next_test_ip4());
         const DATA: u8 = 45;
         const LEN: usize = 123;
@@ -2112,7 +2339,7 @@ mod test {
             stream
                 .flush()
                 .await
-                .expect_err("flush suceeded without ack");
+                .expect_err("flush succeeded without ack");
         });
 
         let sock = UtpSocketRef::bind(client).await.expect("bind failed");
@@ -2122,8 +2349,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_stream_flush_then_send() {
-        let _ = pretty_env_logger::try_init();
+    async fn stream_flush_then_send() {
+        init_logger();
         let server_addr = next_test_ip4();
         let client_addr = next_test_ip4();
 
@@ -2140,16 +2367,19 @@ mod test {
                 assert_eq!(*b, DATA, "data corrupted");
             }
 
-            stream.shutdown().await.expect("failed to shutdown");
+            stream.flush().await.expect("flush failed");
+            stream.shutdown().await.expect("shutdown failed");
         });
 
         let mut stream = stream_connect(client_addr, server_addr).await;
         let buf = [DATA; LEN];
 
-        stream.write_all(&buf).await.expect("failed to write");
-        stream.flush().await.expect("failed to flush");
-        stream.write_all(&buf).await.expect("failed to write");
-        stream.shutdown().await.expect("failed to shutdown");
+        stream.write_all(&buf).await.expect("write failed");
+
+        stream.flush().await.expect("flush failed");
+
+        stream.write_all(&buf).await.expect("write failed");
+        stream.shutdown().await.expect("shutdown failed");
 
         handle.await.expect("task failure");
     }
@@ -2744,7 +2974,7 @@ mod test {
         packet.set_seq_nr(2);
         packet.set_timestamp(456.into());
 
-        socket.insert_into_buffer(packet.clone());
+        socket.insert_into_buffer(packet);
         assert_eq!(socket.incoming_buffer.len(), 3);
         assert_eq!(socket.incoming_buffer[1].seq_nr(), 2);
         assert_eq!(socket.incoming_buffer[1].timestamp(), 128.into());
