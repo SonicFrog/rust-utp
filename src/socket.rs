@@ -4,7 +4,6 @@ use std::future::Future;
 use std::io::{ErrorKind, Result};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -75,7 +74,7 @@ struct DelayDifferenceSample {
 /// retransmission retries to a socket's `max_retransmission_retries` field.
 /// Notice that the initial congestion timeout is 500 ms and doubles with each
 /// timeout.
-pub struct UtpSocket {
+struct UtpSocket {
     /// The wrapped UDP socket
     socket: UdpSocket,
 
@@ -1483,27 +1482,19 @@ impl UtpStream {
     }
 }
 
-impl Deref for UtpStream {
-    type Target = Mutex<UtpSocket>;
-
-    fn deref(&self) -> &Self::Target {
-        self.socket.deref()
-    }
-}
-
 impl AsyncRead for UtpStream
 where
     Self: Unpin,
 {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
         debug!("read poll for {} bytes", buf.len());
 
         let (read, state) = {
-            let mut socket = ready_unpin!(self.lock(), cx);
+            let mut socket = ready_unpin!(self.socket.lock(), cx);
 
             (socket.flush_incoming_buffer(buf), socket.state)
         };
@@ -1532,7 +1523,7 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize>> {
-        let mut socket = ready_unpin!(self.lock(), cx);
+        let mut socket = ready_unpin!(self.socket.lock(), cx);
 
         if socket.state == SocketState::Closed {
             debug!("tried to write on closed connection");
@@ -1612,7 +1603,7 @@ where
             _ => debug!("no message from driver"),
         }
 
-        let mut socket = ready_unpin!(self.lock(), cx);
+        let mut socket = ready_unpin!(self.socket.lock(), cx);
 
         if socket.state == SocketState::Closed {
             return Poll::Ready(Err(SocketError::NotConnected.into()));
@@ -1874,81 +1865,6 @@ impl Drop for UtpSocket {
     }
 }
 
-/// A structure representing a socket server.
-pub struct UtpListener {
-    /// The public facing UDP socket
-    socket: UdpSocket,
-}
-
-impl UtpListener {
-    /// Creates a new `UtpListener` bound to a specific address.
-    ///
-    /// The resulting listener is ready for accepting connections.
-    ///
-    /// The address type can be any implementer of the `ToSocketAddr` trait. See its documentation
-    /// for concrete examples.
-    ///
-    /// If more than one valid address is specified, only the first will be used.
-    pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<UtpListener> {
-        UdpSocket::bind(addr)
-            .await
-            .map(|s| UtpListener { socket: s })
-    }
-
-    /// Accepts a new incoming connection from this listener.
-    ///
-    /// This function will block the caller until a new uTP connection is
-    /// established. When established, the corresponding `UtpSocket` and the
-    /// peer's remote address will be returned.
-    ///
-    /// Notice that the resulting `UtpSocket` is bound to a different local port
-    /// than the public listening port (which `UtpListener` holds). This may
-    /// confuse the remote peer!
-    pub async fn accept(&mut self) -> Result<(UtpSocket, SocketAddr)> {
-        let mut buf = [0; BUF_SIZE];
-
-        let (nread, src) = self.socket.recv_from(&mut buf).await?;
-        let packet = Packet::try_from(&buf[..nread])?;
-
-        // Ignore non-SYN packets
-        if packet.get_type() != PacketType::Syn {
-            let message = format!(
-                "Expected SYN packet, got {:?} instead",
-                packet.get_type()
-            );
-            return Err(SocketError::Other(message).into());
-        }
-
-        let addr = self.socket.local_addr()?;
-
-        // The address of the new socket will depend on the type of the listener.
-        let inner_socket = match addr {
-            SocketAddr::V4(_) => {
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16)).await
-            }
-            SocketAddr::V6(_) => {
-                UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0u16)).await
-            }
-        }?;
-
-        let mut socket = UtpSocket::from_raw_parts(inner_socket, src);
-
-        // Establish connection with remote peer
-        if let Ok(Some(reply)) = socket.handle_packet(&packet, src) {
-            socket.socket.send_to(reply.as_ref(), src).await?;
-
-            Ok((socket, src))
-        } else {
-            Err(SocketError::Other("invalid reply from peer".to_owned()).into())
-        }
-    }
-
-    /// Returns the local socket address of this listener.
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::env;
@@ -1957,7 +1873,7 @@ mod test {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::socket::{SocketState, UtpListener, UtpSocket, BUF_SIZE};
+    use crate::socket::{SocketState, UtpSocket, BUF_SIZE};
     use crate::time::now_microseconds;
 
     use rand;
@@ -2316,8 +2232,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_stream_write_timeout() {
+    async fn stream_write_timeout() {
         init_logger();
+
         let (server, client) = (next_test_ip4(), next_test_ip4());
         const DATA: u8 = 45;
         const LEN: usize = 123;
@@ -3386,16 +3303,6 @@ mod test {
 
         assert!(socket.local_addr().is_ok());
         assert_eq!(socket.local_addr().unwrap(), addr);
-    }
-
-    #[tokio::test]
-    async fn test_listener_local_addr() {
-        let addr = next_test_ip4();
-        let addr = addr.to_socket_addrs().unwrap().next().unwrap();
-        let listener = UtpListener::bind(addr).await.unwrap();
-
-        assert!(listener.local_addr().is_ok());
-        assert_eq!(listener.local_addr().unwrap(), addr);
     }
 
     #[tokio::test]

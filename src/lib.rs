@@ -35,7 +35,6 @@
 extern crate log;
 
 // Public API
-pub use socket::UtpListener;
 pub use socket::UtpSocketRef as UtpSocket;
 pub use socket::UtpStream;
 pub use socket::UtpStreamDriver;
