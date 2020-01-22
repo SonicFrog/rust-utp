@@ -1250,12 +1250,7 @@ impl UtpSocketRef {
         self,
         dst: SocketAddr,
     ) -> Result<(UtpStream, UtpStreamDriver)> {
-        let socket = self.0.lock().await;
-        let my_addr = match socket.local_addr()? {
-            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0u16).into(),
-            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0u16).into(),
-        };
-        let mut socket = UtpSocket::bind(my_addr).await?;
+        let mut socket = self.0.lock().await;
 
         socket.connected_to = dst;
 
@@ -1272,10 +1267,9 @@ impl UtpSocketRef {
             packet.set_timestamp(now_microseconds());
 
             debug!("connecting to {}", socket.connected_to);
-            socket
-                .socket
-                .send_to(packet.as_ref(), socket.connected_to)
-                .await?;
+            let dst = socket.connected_to;
+
+            socket.socket.send_to(packet.as_ref(), dst).await?;
             socket.state = SocketState::SynSent;
             debug!("sent {:?}", packet);
 
@@ -1306,9 +1300,11 @@ impl UtpSocketRef {
         let (tx, rx) = unbounded_channel();
 
         let local = socket.local_addr()?;
-        let socket = Arc::new(Mutex::new(socket));
-        let driver = UtpStreamDriver::new(socket.clone(), tx);
-        let stream = UtpStream::new(socket, rx, local, remote);
+
+        mem::drop(socket);
+
+        let driver = UtpStreamDriver::new(self.0.clone(), tx);
+        let stream = UtpStream::new(self.0, rx, local, remote);
 
         Ok((stream, driver))
     }
