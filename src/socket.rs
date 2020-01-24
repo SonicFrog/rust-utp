@@ -837,6 +837,37 @@ impl UtpSocket {
         debug!("self.curr_window: {}", self.curr_window);
     }
 
+    fn handle_fin_packet(
+        &mut self,
+        packet: &Packet,
+        src: SocketAddr,
+    ) -> Packet {
+        if packet.ack_nr() < self.seq_nr {
+            debug!("FIN received but there are missing acknowledgements for sent packets");
+        }
+        let mut reply = self.prepare_reply(packet, PacketType::State);
+        if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
+            debug!(
+                "current ack_nr ({}) is behind received packet seq_nr ({})",
+                self.ack_nr,
+                packet.seq_nr()
+            );
+
+            // Set SACK extension payload if the packet is not in order
+            let sack = self.build_selective_ack();
+
+            if !sack.is_empty() {
+                reply.set_sack(sack);
+            }
+        }
+
+        debug!("received FIN from {}, connection is closed", src);
+
+        // Give up, the remote peer might not care about our missing packets
+        self.state = SocketState::Closed;
+        reply
+    }
+
     /// Handles an incoming packet, updating socket state accordingly.
     ///
     /// Returns the appropriate reply packet, if needed.
@@ -906,30 +937,7 @@ impl UtpSocket {
             }
             (SocketState::Connected, PacketType::Fin)
             | (SocketState::FinSent, PacketType::Fin) => {
-                if packet.ack_nr() < self.seq_nr {
-                    debug!("FIN received but there are missing acknowledgements for sent packets");
-                }
-                let mut reply = self.prepare_reply(packet, PacketType::State);
-                if packet.seq_nr().wrapping_sub(self.ack_nr) > 1 {
-                    debug!(
-                            "current ack_nr ({}) is behind received packet seq_nr ({})",
-                            self.ack_nr,
-                            packet.seq_nr()
-                        );
-
-                    // Set SACK extension payload if the packet is not in order
-                    let sack = self.build_selective_ack();
-
-                    if !sack.is_empty() {
-                        reply.set_sack(sack);
-                    }
-                }
-
-                debug!("received FIN from {}, connection is closed", src);
-
-                // Give up, the remote peer might not care about our missing packets
-                self.state = SocketState::Closed;
-                Ok(Some(reply))
+                Ok(Some(self.handle_fin_packet(packet, src)))
             }
             (SocketState::Closed, PacketType::Fin) => {
                 Ok(Some(self.prepare_reply(packet, PacketType::State)))
