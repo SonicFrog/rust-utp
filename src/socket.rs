@@ -1048,6 +1048,46 @@ impl UtpSocket {
         debug!("max_allowed_cwnd: {}", max_allowed_cwnd);
     }
 
+    fn handle_packet_extension(
+        &mut self,
+        packet: &Packet,
+        packet_loss_detected: &mut bool,
+    ) {
+        // Process extensions, if any
+        for extension in packet.extensions() {
+            if extension.get_type() == ExtensionType::SelectiveAck {
+                // If three or more packets are acknowledged past the implicit missing one,
+                // assume it was lost.
+                if extension.iter().count_ones() >= 3 {
+                    self.resend_lost_packet(packet.ack_nr() + 1);
+                    *packet_loss_detected = true;
+                }
+
+                if let Some(last_seq_nr) =
+                    self.send_window.last().map(Packet::seq_nr)
+                {
+                    let lost_packets = extension
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, received)| !received)
+                        .map(|(idx, _)| packet.ack_nr() + 2 + idx as u16)
+                        .take_while(|&seq_nr| seq_nr < last_seq_nr);
+
+                    for seq_nr in lost_packets {
+                        debug!("SACK: packet {} lost", seq_nr);
+                        self.resend_lost_packet(seq_nr);
+                        *packet_loss_detected = true;
+                    }
+                }
+            } else {
+                debug!(
+                    "Unknown extension {:?}, ignoring",
+                    extension.get_type()
+                );
+            }
+        }
+    }
+
     fn handle_state_packet(&mut self, packet: &Packet) {
         if packet.ack_nr() == self.last_acked {
             self.duplicate_ack_count += 1;
@@ -1095,39 +1135,7 @@ impl UtpSocket {
         let mut packet_loss_detected: bool =
             !self.send_window.is_empty() && self.duplicate_ack_count == 3;
 
-        // Process extensions, if any
-        for extension in packet.extensions() {
-            if extension.get_type() == ExtensionType::SelectiveAck {
-                // If three or more packets are acknowledged past the implicit missing one,
-                // assume it was lost.
-                if extension.iter().count_ones() >= 3 {
-                    self.resend_lost_packet(packet.ack_nr() + 1);
-                    packet_loss_detected = true;
-                }
-
-                if let Some(last_seq_nr) =
-                    self.send_window.last().map(Packet::seq_nr)
-                {
-                    let lost_packets = extension
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, received)| !received)
-                        .map(|(idx, _)| packet.ack_nr() + 2 + idx as u16)
-                        .take_while(|&seq_nr| seq_nr < last_seq_nr);
-
-                    for seq_nr in lost_packets {
-                        debug!("SACK: packet {} lost", seq_nr);
-                        self.resend_lost_packet(seq_nr);
-                        packet_loss_detected = true;
-                    }
-                }
-            } else {
-                debug!(
-                    "Unknown extension {:?}, ignoring",
-                    extension.get_type()
-                );
-            }
-        }
+        self.handle_packet_extension(packet, &mut packet_loss_detected);
 
         // Three duplicate ACKs mean a fast resend request. Resend the first
         // unacknowledged packet if the incoming packet doesn't have a SACK
