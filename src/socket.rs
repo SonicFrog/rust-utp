@@ -1417,6 +1417,35 @@ impl UtpStream {
         packet
     }
 
+    fn handle_driver_message(
+        msg: Poll<Option<Result<()>>>,
+    ) -> Poll<Result<()>> {
+        match msg {
+            Poll::Ready(None) => {
+                debug!("driver is dead, closing success");
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Ok(()))) => {
+                debug!("driver sent closing notice");
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(e)))
+                if e.kind() == ErrorKind::NotConnected =>
+            {
+                debug!("connection closed by err");
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                debug!("failed to close correctly");
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                debug!("waiting for driver to complete closing");
+                Poll::Pending
+            }
+        }
+    }
+
     fn wait_acks(
         socket: &mut UtpSocket,
         cx: &mut Context<'_>,
@@ -1653,30 +1682,7 @@ where
 
                 let msg = poll_unpin!(self.receiver.recv(), cx);
 
-                match msg {
-                    Poll::Ready(None) => {
-                        debug!("driver is dead, closing success");
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Some(Ok(()))) => {
-                        debug!("driver sent closing notice");
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Some(Err(e)))
-                        if e.kind() == ErrorKind::NotConnected =>
-                    {
-                        debug!("connection closed by err");
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Some(Err(e))) => {
-                        debug!("failed to close correctly");
-                        Poll::Ready(Err(e))
-                    }
-                    Poll::Pending => {
-                        debug!("waiting for driver to complete closing");
-                        Poll::Pending
-                    }
-                }
+                Self::handle_driver_message(msg)
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
