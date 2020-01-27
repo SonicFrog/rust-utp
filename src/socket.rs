@@ -2,8 +2,9 @@ use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{ErrorKind, Result};
+use std::iter::Iterator;
 use std::mem;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -17,7 +18,7 @@ use crate::util::*;
 use rand;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
@@ -196,10 +197,14 @@ impl UtpSocket {
     }
 
     /// Creates a new UTP socket from the given address.
-    pub async fn bind(addr: SocketAddr) -> Result<UtpSocket> {
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<UtpSocket> {
+        let src = lookup_host(&addr)
+            .await?
+            .last()
+            .ok_or(ErrorKind::AddrNotAvailable)?;
         let socket = UdpSocket::bind(addr).await?;
 
-        Ok(UtpSocket::from_raw_parts(socket, addr))
+        Ok(UtpSocket::from_raw_parts(socket, src))
     }
 
     /// Returns the socket address that this socket was created from.
@@ -220,11 +225,7 @@ impl UtpSocket {
 
     /// Opens a connection to a remote host by hostname or IP address.
     pub async fn connect(addr: SocketAddr) -> Result<UtpSocket> {
-        let my_addr = match addr {
-            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0u16).into(),
-            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0u16).into(),
-        };
-        let mut socket = UtpSocket::bind(my_addr).await?;
+        let mut socket = UtpSocket::bind(addr).await?;
         socket.connected_to = addr;
 
         let mut packet = Packet::new();
